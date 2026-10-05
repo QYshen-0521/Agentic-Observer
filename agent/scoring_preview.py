@@ -149,7 +149,11 @@ def preview_actions(
     (observing one beats a penalised avoidable wait) but never outrank
     unfinished or request-valuable work.
     """
-    if snapshot.get("schema_version") not in ("decision-snapshot-v2", "decision-snapshot-v3"):
+    if snapshot.get("schema_version") not in (
+        "decision-snapshot-v2", "decision-snapshot-v3", "decision-snapshot-v4", "decision-snapshot-v5",
+        "v4-decision-snapshot-v1", "v4-decision-snapshot-v2", "v4-decision-snapshot-v3",
+        "v5-decision-snapshot-v1", "v5-decision-snapshot-v2",
+    ):
         raise ValueError("unsupported decision snapshot schema_version")
     score_config = scoring_contract["score_config"]
     if score_config.get("schema_version") != "challenge-score-v3":
