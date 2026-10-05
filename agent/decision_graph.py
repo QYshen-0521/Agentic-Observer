@@ -79,8 +79,11 @@ def _parse_object(text: str) -> dict[str, object]:
 
 
 def _prepare(state: DecisionState) -> dict[str, object]:
+    # The initialize payload may use either "scoring_contract" (v2/v3) or "scoring" (v4)
+    init_pub = state["initial_publication"]
+    contract = init_pub.get("scoring_contract") or init_pub.get("scoring") or {}
     previews = preview_actions(
-        state["snapshot"], state["initial_publication"]["scoring_contract"],
+        state["snapshot"], contract,
         state.get("tile_best_scores"),
     )
     top = previews[: state["top_k"]]
