@@ -1,15 +1,11 @@
 {
   "schema_version": "observer-project-v1",
-  "entry_point": "agent/minimal_agent.py",
-  "agent_directory": "agent",
-  "requirements": "agent/requirements.txt",
-  "adapter": {
-    "type": "none",
-    "skip_auto_adaptation": true
+  "run": ["python3", "-u", "agent/minimal_agent.py"],
+  "build": [],
+  "image": "python:3.11",
+  "protocol": "jsonl-v2",
+  "environment": {
+    "MODEL_PROVIDER": "deterministic"
   },
-  "protocol": {
-    "version": "participant-agent-protocol-v2",
-    "initialize_schema": "initial-publication-v2",
-    "snapshot_schema": "decision-snapshot-v3"
-  }
+  "working_directory": "."
 }
