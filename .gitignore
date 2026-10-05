@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.survey26-cache/
 .DS_Store
 *.pickle
 
