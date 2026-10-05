@@ -83,6 +83,9 @@ class Planner:
         self._request_thresholds_now: dict = {}
         self.required_priority = 1.0
         self.required_bonus = max(0.0, state.scoring.required_penalty) * 1.2
+        self._fiber_centers = tuple(self.grid.fiber_center(i) for i in range(self.grid.n))
+        self._decision_values = None
+        self._decision_models = None
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -354,18 +357,37 @@ class Planner:
                 self._request_bonus[i] = self._request_bonus.get(i, 0.0) + 0.65 * reward / remaining
 
     def _value(self, i: int) -> float:
+        if self._decision_values is not None and i in self._decision_values:
+            return self._decision_values[i]
         state = self.state
         top = max(state.scoring.program_multipliers.values())
         gain = max(0.0, state.weight[i] * top - state.best_score[i])
         if state.required[i] and state.factor[i] < state.scoring.required_threshold:
             gain += self.required_bonus * self.required_priority
         gain += self._request_bonus.get(i, 0.0)
-        return gain * max(0.2, 0.8 ** state.misses[i])
+        value = gain * max(0.2, 0.8 ** state.misses[i])
+        if self._decision_values is not None:
+            self._decision_values[i] = value
+        return value
+
+    def _target_model(self, i, alt, moon):
+        if self._decision_models is not None and i in self._decision_models:
+            return self._decision_models[i]
+        state = self.state
+        model = state.scoring.quality_model(alt, lunar_factor(
+            moon, state.ra[i], state.dec[i], state.scoring.lunar_model)) or 0.0
+        if self._decision_models is not None:
+            self._decision_models[i] = model
+        return model
 
     # -- main planning pass -------------------------------------------------------
 
     def plan(self, now, night_end, night_index: int, hours: float):
         state = self.state
+        # Snapshot-local caches: feedback, model advice and request progress can
+        # all change between calls. Never reuse these across decision requests.
+        self._decision_values = {}
+        self._decision_models = {}
         state.update_scale(hours)
         lst = local_sidereal_deg(now, state.lon)
         horizon = min(night_end, state.survey_end)
@@ -411,8 +433,7 @@ class Planner:
             if cached is not None:
                 return cached
             alt, az = altaz(i)
-            lunar = lunar_factor(moon, state.ra[i], state.dec[i], scoring.lunar_model)
-            model = scoring.quality_model(alt, lunar) or 0.0
+            model = self._target_model(i, alt, moon)
             k = (state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
             ha = wrap180(lst - state.ra[i])
             up = (state.hmax[i] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[i] < 180 else 1e9
@@ -455,7 +476,7 @@ class Planner:
             near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], 1.42 * self.grid.fov) if j in visible]
             near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
-                d_north, d_east = self.grid.fiber_center(fiber)
+                d_north, d_east = self._fiber_centers[fiber]
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
                 if not (state.min_alt + 1.5 <= c_alt <= 89.0):
                     continue
@@ -523,8 +544,7 @@ class Planner:
             info[fiber] = []
             for _, j, margin in options:
                 alt, az = altaz(j)
-                lunar = lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)
-                model = scoring.quality_model(alt, lunar)
+                model = self._target_model(j, alt, moon)
                 up = (state.hmax[j]-wrap180(lst-state.ra[j])) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
                 k = state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
                 band = scoring.program_band(model * state.band_scale)
