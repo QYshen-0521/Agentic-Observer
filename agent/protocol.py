@@ -6,7 +6,6 @@ from typing import Mapping, Sequence
 
 
 PROTOCOL_VERSION = "participant-agent-protocol-v2"
-INITIAL_PUBLICATION_VERSION = "initial-publication-v2"
 DECISION_SNAPSHOT_VERSION = "decision-snapshot-v3"
 
 # Accept all known protocol versions for maximum compatibility.
@@ -23,6 +22,13 @@ ACCEPTED_SNAPSHOT_VERSIONS = (
     "decision-snapshot-v4",
     "decision-snapshot-v5",
 )
+# Accept all known initial publication versions.
+ACCEPTED_INITIAL_PUBLICATION_VERSIONS = (
+    "initial-publication-v1",
+    "initial-publication-v2",
+    "initial-publication-v3",
+    "initial-publication-v4",
+)
 
 
 class ProtocolError(ValueError):
@@ -38,7 +44,7 @@ def parse_platform_message(message: Mapping[str, object]) -> tuple[str, dict]:
     if not isinstance(payload, dict):
         raise ProtocolError("platform message payload must be an object")
     if message_type == "initialize":
-        if payload.get("schema_version") != INITIAL_PUBLICATION_VERSION:
+        if payload.get("schema_version") not in ACCEPTED_INITIAL_PUBLICATION_VERSIONS:
             raise ProtocolError("unsupported initial publication schema_version")
     elif message_type == "decision_request":
         if payload.get("schema_version") not in ACCEPTED_SNAPSHOT_VERSIONS:
