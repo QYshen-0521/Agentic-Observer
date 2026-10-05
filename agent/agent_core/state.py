@@ -3,14 +3,14 @@ progress. Built once from `initialize`, then updated from every `decision_reques
 messages and `last_result`. Holds no hidden data -- only what the public protocol
 hands us, plus what we infer from our own hits (never from a file).
 
-Mirrors the structure-of-parallel-arrays design (ids/ra/dec/flux/weight/required/...,
-all indexed by the same integer i) used by this project's companion TypeScript example,
-so both examples solve the same problem the same way and can be compared directly.
+The public catalogue uses parallel arrays indexed by target. Actual scores and
+completion-factor intervals have separate ledgers because program matching is hidden.
 """
 from __future__ import annotations
 
 import bisect
 import math
+import statistics
 from collections import deque
 from typing import NamedTuple, Optional
 
@@ -19,8 +19,8 @@ from .scoring import ScoringModel
 
 ALT_MARGIN_DEG = 0.6
 SKY_MEMORY_HOURS = 2.0
-RECENT_SAMPLES = 60
-EARLIER_SAMPLES = 60
+RECENT_SAMPLES = 12
+EARLIER_SAMPLES = 24
 SIDEREAL_DEG_PER_SECOND = 360.98564736629 / 86400.0
 
 
@@ -41,6 +41,14 @@ class FaultEvidence(NamedTuple):
     earlier_samples: int
     dark_checks: int
     dark_matched: int
+
+
+class ExposureRecord(NamedTuple):
+    action_index: int
+    target_id: str
+    factor_low: float
+    factor_high: float
+    score: float
 
 
 def _mod(a: float, n: float) -> float:
@@ -102,6 +110,8 @@ class SurveyState:
         n = len(self.ids)
         self.hmax = [max_hour_angle_deg(self.dec[i], self.lat, self.min_alt + ALT_MARGIN_DEG) for i in range(n)]
         self.factor = [0.0] * n
+        self.factor_high = [0.0] * n
+        self.best_score = [0.0] * n
         self.misses = [0] * n
         self.attempts = [0] * n
         self.active = [i for i in range(n) if self.hmax[i] > 0.0]
@@ -112,11 +122,12 @@ class SurveyState:
 
         self.scale = 1.0
         self.prior_scale = 1.0
+        self.band_scale = 1.0
         self._samples: deque = deque(maxlen=24)           # (hours, ratio)
         self._all_ratios: deque = deque(maxlen=400)        # ratio
         self.clean_history: list[tuple[float, int, float]] = []  # (hours, night, ratio)
         self.pending_night = -1
-        self._band_checks: deque = deque(maxlen=60)        # (program, matched, model)
+        self._band_checks: deque = deque(maxlen=60)        # (hours, program, matched, model)
         self.force_program: Optional[str] = None
         self.pending: dict[str, PendingPrediction] = {}
         self.pending_program = "BACKUP"
@@ -128,11 +139,11 @@ class SurveyState:
         self.duration_scale = 1.0
         self.fast_level = 0
 
-        # Per-observe-action ledger: (observe_action_index, target_id, factor), mirroring
-        # the backend's own BestLedger so a Hard-mode state_resync can be answered exactly
-        # (see _resync) instead of only from the resync message's best_scores.
-        self.ledger: list[tuple[int, str, float]] = []
+        # Actual scores are exact; factors remain intervals when program matching is
+        # ambiguous. Never label an estimate as the backend's exact completion factor.
+        self.ledger: list[ExposureRecord] = []
         self.pending_action_index: Optional[int] = None
+        self._cell_ra = {key: [r for r, _ in band] for key, band in self._cells.items()}
 
     # -- spatial index -------------------------------------------------------
 
@@ -161,7 +172,7 @@ class SurveyState:
                 spans = [(lo, 360.0), (0.0, hi - 360.0)]
             else:
                 spans = [(lo, hi)]
-            keys = [r for r, _ in band]
+            keys = self._cell_ra[key]
             for low, high in spans:
                 start = bisect.bisect_left(keys, low)
                 end = bisect.bisect_right(keys, high)
@@ -210,35 +221,18 @@ class SurveyState:
                         if n.get("event_kind") != "terrain_obstruction"}
 
     def _resync(self, message: dict) -> None:
-        """Hard-mode state_resync (participant guide, Appendix A / section 8): a prior
-        window of `observe` actions was invalidated. The message itself only gives
-        `best_scores` (score, not factor) for targets with any surviving valid hit --
-        the guide is explicit that it does not return each target's completion factor,
-        and that an agent that needs it exactly should combine `invalidated_window`
-        with its own saved valid-exposure history.
-
-        We can do exactly that: every entry in `self.ledger` already holds the EXACT
-        factor for one past observe action (on_result backs it out of the real score
-        the backend returned, the public weight, and whichever of the two public
-        program multipliers it matches -- not an estimate). Dropping the ledger
-        entries inside the invalidated action-index window and taking, per target, the
-        max factor among what is left reproduces the backend's own ledger exactly --
-        this is a reconstruction, not an approximation from best_score.
-
-        The only remaining uncertainty: a target with no ledger entry at all (e.g. this
-        process restarted mid-run and lost its in-memory history) falls back to the old
-        best_score/top_multiplier estimate below, same as before this change.
-        """
+        """Rollback score and factor bounds using valid exposure history and public resync."""
         window = message.get("invalidated_window") or {}
         start, end = window.get("action_index_start"), window.get("action_index_end_exclusive")
         if start is not None and end is not None:
             self.ledger = [entry for entry in self.ledger if not (start <= entry[0] < end)]
         else:
             self.ledger = []  # no window given: nothing in the ledger can be trusted
-        exact: dict[str, float] = {}
-        for _, target_id, factor in self.ledger:
-            if factor > exact.get(target_id, 0.0):
-                exact[target_id] = factor
+        low: dict[str, float] = {}
+        high: dict[str, float] = {}
+        for entry in self.ledger:
+            low[entry.target_id] = max(low.get(entry.target_id, 0.0), entry.factor_low)
+            high[entry.target_id] = max(high.get(entry.target_id, 0.0), entry.factor_high)
 
         best_scores = message.get("best_scores") or []
         best: dict[str, float] = {}
@@ -252,11 +246,13 @@ class SurveyState:
 
         for i in range(len(self.ids)):
             target_id = self.ids[i]
-            if target_id in exact:
-                self.factor[i] = exact[target_id]
-                continue
             score = best.get(target_id, 0.0)
-            self.factor[i] = min(1.0, score / (self.weight[i] * top_multiplier)) if score > 0 and self.weight[i] > 0 else 0.0
+            self.best_score[i] = score
+            fallback = min(1.0, score / (self.weight[i] * top_multiplier)) if score > 0 and self.weight[i] > 0 else 0.0
+            self.factor[i] = low.get(target_id, fallback)
+            self.factor_high[i] = high.get(target_id, min(1.0, score / max(1e-9, self.weight[i] * self.scoring.mismatch_multiplier)))
+            self.misses[i] = 0
+            self.attempts[i] = 0
         self.active = [i for i in range(len(self.ids)) if self.hmax[i] > 0.0]
         self.pending.clear()
         self.pending_action_index = None
@@ -285,6 +281,8 @@ class SurveyState:
         declared_multiplier = multipliers.get(self.pending_program, 1.0)
         f0t0 = scoring.f0t0
 
+        exposure_ratios = []
+        clean_ratios = []
         for target_id, prediction in self.pending.items():
             i = self.index_of.get(target_id)
             if i is None:
@@ -298,31 +296,36 @@ class SurveyState:
                     self.blocked.append((prediction.az, prediction.alt))
                 continue
             weight = self.weight[i] if self.weight[i] > 0 else 1e-9
+            self.best_score[i] = max(self.best_score[i], score)
             multiplier_seen = score / weight
-            if prediction.clean:
-                if abs(multiplier_seen - declared_multiplier) < 2e-4:
-                    self._band_checks.append((self.pending_program, True, prediction.model))
-                elif abs(multiplier_seen - mismatch) < 2e-4:
-                    self._band_checks.append((self.pending_program, False, prediction.model))
-            factor_if_match = score / (weight * declared_multiplier) if declared_multiplier > 0 else 0.0
-            factor_if_miss = score / (weight * mismatch) if mismatch > 0 else 0.0
-            ratio_match = (factor_if_match * f0t0) / (self.flux[i] * self.pending_duration * prediction.model) \
-                if self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0 else 0.0
-            band = scoring.program_band(ratio_match * prediction.band_model)
-            matched = band == self.pending_program
-            factor = factor_if_match if matched else factor_if_miss
-            factor = min(1.0, factor)
+            # A score above the largest mismatched score proves a match. Below that,
+            # both hypotheses can be physically valid (instrument efficiency is hidden).
+            possible = [score / (weight * m) for m in {declared_multiplier, mismatch}
+                        if m > 0 and score / (weight * m) <= 1.0 + 2e-4]
+            if not possible:
+                possible = [1.0]  # rounded saturated feedback
+            factor = min(1.0, min(possible))
+            upper = min(1.0, max(possible))
+            if prediction.clean and multiplier_seen > mismatch + 2e-4:
+                self._band_checks.append((hours, self.pending_program, True, prediction.model))
             self.factor[i] = max(self.factor[i], factor)
+            self.factor_high[i] = max(self.factor_high[i], upper)
             if action_index is not None:
-                self.ledger.append((action_index, target_id, factor))
+                self.ledger.append(ExposureRecord(action_index, target_id, factor, upper, score))
             if self.required[i] and self.factor[i] < scoring.required_threshold:
                 self.attempts[i] += 1
             if factor < 0.97 and self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0:
                 ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
-                self._samples.append((hours, ratio))
-                self._all_ratios.append(ratio)
+                exposure_ratios.append(ratio)
                 if prediction.clean:
-                    self.clean_history.append((hours, self.pending_night, ratio))
+                    clean_ratios.append(ratio)
+        # Fibre hits in one exposure share weather: one exposure is one sample.
+        if exposure_ratios:
+            ratio = statistics.median(exposure_ratios)
+            self._samples.append((hours, ratio))
+            self._all_ratios.append(ratio)
+        if clean_ratios:
+            self.clean_history.append((hours, self.pending_night, statistics.median(clean_ratios)))
         self.pending.clear()
         self.update_scale(hours)
 
@@ -335,6 +338,9 @@ class SurveyState:
             self.prior_scale = ordered[len(ordered) // 2]
         recent = sorted(ratio for when, ratio in self._samples if when >= hours - SKY_MEMORY_HOURS)
         self.scale = max(0.05, recent[len(recent) // 2]) if len(recent) >= 4 else self.prior_scale
+        # Do not automatically interpret an efficiency collapse as a new program band.
+        if self.scale >= 0.65 * self.band_scale:
+            self.band_scale = 0.9 * self.band_scale + 0.1 * self.scale / 0.95
 
     # -- fault diagnostics ------------------------------------------------------
 
@@ -346,7 +352,7 @@ class SurveyState:
         earlier = history[:-RECENT_SAMPLES]
         span = recent[-1][0] - recent[0][0]
         nights = len({night for _, night, _ in recent})
-        if span < 4.0 or nights < 2:
+        if span < 3.0:
             return None
         recent_sorted = sorted(r for _, _, r in recent)
         earlier_sorted = sorted(r for _, _, r in earlier)
@@ -354,7 +360,7 @@ class SurveyState:
         earlier_median = earlier_sorted[len(earlier_sorted) // 2]
         dark_line = self.scoring.program_bands["DARK"] * 1.3
         dark = [c for c in list(self._band_checks)[-16:]
-                if c[0] == "DARK" and (c[2] * earlier_median) / 0.95 >= dark_line]
+                if c[0] >= recent[0][0] and c[1] == "DARK" and (c[3] * earlier_median) / 0.95 >= dark_line]
         return FaultEvidence(
             recent_median=round(recent_median, 3),
             earlier_median=round(earlier_median, 3),
@@ -363,7 +369,7 @@ class SurveyState:
             recent_nights=nights,
             earlier_samples=len(earlier),
             dark_checks=len(dark),
-            dark_matched=sum(1 for c in dark if c[1]),
+            dark_matched=sum(1 for c in dark if c[2]),
         )
 
     def forget_quality_history(self) -> None:

@@ -5,7 +5,7 @@ and docs/participant-guide.en.md for the complete public protocol.
 
 Run agent.py with Python 3.9+. Standard library only. Configure OPENAI_API_KEY,
 OPENAI_BASE_URL and OPENAI_MODEL on the platform; no key gives deterministic fallback.
-Nightly notice parsing feeds task planning; bounded advice influences the planner.
+Changed conditions trigger notice parsing followed by task planning; bounded advice influences the planner.
 Use OBSERVER_MODEL_DISABLED=1 for deterministic tests.
 
 Submit the repository root through GitHub after pushing an exact commit:

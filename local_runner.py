@@ -14,7 +14,12 @@ def main():
     parser.add_argument('--agent-dir', type=Path, default=ROOT/'agent')
     parser.add_argument('--wallclock', type=float, default=900)
     parser.add_argument('--out', type=Path, default=ROOT/'strategy_review_output/v4_rebuild/local-run')
-    parser.add_argument('--with-model', action='store_true', help='enable local model variables from agent/.env')
+    model = parser.add_mutually_exclusive_group()
+    model.add_argument('--with-model', dest='with_model', action='store_true',
+                       help='enable the model (default); read credentials from agent/.env')
+    model.add_argument('--without-model', dest='with_model', action='store_false',
+                       help='run deterministic planning without model calls')
+    parser.set_defaults(with_model=True)
     args = parser.parse_args()
     if not (KIT/'run_local.py').exists():
         raise SystemExit('Download the official kit first: python tools/fetch_local_kit.py')
@@ -27,8 +32,11 @@ def main():
     build_env = runner.agent_environment
     def agent_env(*values, **keywords):
         env, names = build_env(*values, **keywords)
-        if not args.with_model:
-            env['OBSERVER_MODEL_DISABLED'] = '1'
+        env['OBSERVER_MODEL_DISABLED'] = '0' if args.with_model else '1'
+        if args.with_model and not (env.get('OPENAI_API_KEY', '').strip()
+                                   or env.get('KIMI_API_KEY', '').strip()):
+            raise SystemExit('Missing local model key: configure agent/.env from agent/.env.example, '
+                             'or use --without-model.')
         return env, names
     runner.agent_environment = agent_env
     card = args.card if Path(args.card).is_dir() else str(KIT.parent/'cards'/args.card)

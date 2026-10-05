@@ -1,70 +1,30 @@
-# GitHub 提交与工作区清理
+# GitHub 提交记录
 
-2026-10-05 起，本项目统一使用 GitHub 仓库提交比赛。
+本轮策略优化已完成本地四卡对照，结果见 [STRATEGY_ZH.md](STRATEGY_ZH.md)。平台提交信息将在新版本准备完成后更新。
 
-## 已完成的清理与推送
+## 提交流程
 
-- 删除 legacy_v3、旧 V3 评测缓存和过时审阅脚本。
-- 删除根目录和 agent 内的 ZIP 打包脚本，移除 agent 内的重复执行清单。
-- 保留 V4 程序、回归测试、官方协议文档、本地工具和比赛证据。
-- 当前主干覆盖旧 V3 内容，同时用合并提交保留室友的 11 个远端提交历史，没有强制推送。
-- 8 项回归测试通过；独立运行测试现验证仓库根清单的实际启动命令。
-- 官方 CLI 缓存在本机忽略目录，不将密钥、任务卡、缓存或成绩包提交到 Git。
-
-## 本次参赛源码
-
-仓库：[QYshen-0521/Agentic-Observer](https://github.com/QYshen-0521/Agentic-Observer)。
-
-固定源码：[3dedd9c4c77213074b551f9ac5b394df5185b0bc](https://github.com/QYshen-0521/Agentic-Observer/commit/3dedd9c4c77213074b551f9ac5b394df5185b0bc)。平台返回的 source_commit 与该 commit 完全一致。
-
-版本：`52fc3d67-939a-433f-91a5-aa635833cbc9`，source_kind 为 repository。
-启动：`python3 -u agent/agent.py`，build 和 adapter_files 均为空。
-
-公开测试已通过，以 survey_complete 正常结束，两个模型阶段各成功调用 5 次。
-正式在线评测批次：`1ca310d7-35c7-42a2-8c0a-6689eec15e9c`，启用模型、非 repeat；本次只启动这一个正式批次。
-
-正式四卡及整批状态均为 **scored**，平均分 **22609.22246875**。
-
-| 卡 | 分数 | 必做缺失 | 标准化 CPU 秒 | 公告解析成功 | 夜间规划成功 |
-|---|---:|---:|---:|---:|---:|
-| A | 16267.748291 | 4 | 120.321 | 8 | 4 |
-| B | 33512.887524 | 1 | 206.012 | 7 | 5 |
-| C | 11211.926185 | 4 | 151.043 | 6 | 4 |
-| D | 29444.327875 | 2 | 109.612 | 8 | 4 |
-
-四卡均确认 participant-agent-protocol-v4，以 survey_complete 正常结束，未达到 CPU
-或实际时间上限；未发现初始化、策略或动作校验错误。官方结果包的分数与 CLI 一致，
-decisions、messages、observations 三类文件的摘要均与官方评分报告相符。D 卡经过一次
-state_resync，1182 条观测失效后仍完整完成。
-
-已执行 final set，并由 final show 核对：当前选中的最终版本为 GitHub 版本
-52fc3d67，来源 chosen；截止北京时间 2026-10-07 23:59:59 前仍可修改。
-历史最高线上分仍为首次评测的 24029.60260025，它与所选最终源码是不同字段。
-本次使用一次正式评测额度，当前当天共用 2/40、剩余 38 次。
-
-参赛源码固定为上述 3dedd9c commit；之后推送的成绩记录与工作流程文档不改变已冻结源码。
-
-## 本次分数波动
-
-12 个运行时 Python 文件与首次已计分提交逐项一致（统一换行后比较）。C 卡由首次
-16909.523632 降至本次 11211.926185，但两次均完整结束，未耗尽预算；同一卡的
-scenario 摘要也一致。首次日志显示搜索档位从 1 切换至 0，本次始终为 0，模型输出也
-不同。这些是已观察到的差异，尚未通过控制实验隔离根因，不能把分数变化归因于 GitHub
-提交方式。后续可优先检查搜索档位对机器校准的敏感性与故障报告、曝光策略的稳定性。
-
-四卡仍未完成观测请求；必做缺失与指向偏移标定也仍有优化空间。本次清理不等于策略性能优化。
-
-## 后续流程
-
-修改代码后运行测试、提交并推送，再执行：
+比赛统一使用公开 GitHub 仓库 [QYshen-0521/Agentic-Observer](https://github.com/QYshen-0521/Agentic-Observer) 和固定 commit。
 
 ```powershell
-python submit_competition.py
+python -m unittest discover -s tests -v
+git add <本次修改的文件>
+git commit -m "Optimize V4 observing strategy"
+git push origin main
+python submit_competition.py --title "V4 joint planning and feedback calibration"
 ```
 
-脚本校验工作区干净、main 的 commit 已推到 origin/main，以及唯一的根执行清单，
-再用官方 project submit-repo 提交固定 SHA。它仅发起准备任务；审阅、确认、评测和
-最终版本选择的完整命令见 README.md。后续不上传 ZIP 项目。
+脚本校验工作区干净、main 已推送，以及根执行清单，随后提交该 commit。审阅平台的实际 manifest、adapter_files 与公开测试日志后确认版本。不使用 ZIP 项目提交，不强制推送。
 
-历史 ZIP 和成绩压缩包仅作为本地证据保留，不作为后续提交方式。
-原始证据位于 strategy_review_output/github_submissions/3dedd9c4c77213074b551f9ac5b394df5185b0bc/。
+正式在线评测与最终版本选择是后续独立操作。提交源码或通过公开测试不等于已有正式新分数。
+
+## 历史正式证据
+
+| 来源 | 平台版本 | 正式 A–D 平均分 | 固定源码 |
+|---|---|---:|---|
+| 首次 V4 重建 | b21a1616-a0d1-48cd-a12e-cb9682700a10 | 24029.60260025 | 历史本地来源包 |
+| 上次 GitHub 提交 | 52fc3d67-939a-433f-91a5-aa635833cbc9 | 22609.22246875 | 3dedd9c4c77213074b551f9ac5b394df5185b0bc |
+
+原始证据保存在本地 `strategy_review_output/v4_rebuild/` 和 `strategy_review_output/github_submissions/`。历史 ZIP 仅是证据，不是后续提交方式。
+
+旧 V3 审阅报告和根迁移说明已移除；旧输出集中归档在 `strategy_review_output/history_legacy/`。当前流程以根 README、本页和策略说明为准。

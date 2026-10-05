@@ -1,27 +1,13 @@
-"""Decision logic: pick a pointing, fill the 16 fibres, choose exposure length and
-program -- or wait / report / finish.
+"""Bounded joint pointing, fibre, exposure and program search using public inputs.
 
-1. Rank visible, not-yet-done targets. Required targets that are not done yet get a
-   bonus (missing one costs real points at the end). Targets that set soon, or that
-   have few nights left, rank higher.
-2. For the best few "anchor" candidates, try each fibre as the pointing centre; fill
-   every fibre with the best-value neighbour that lands on its glass; keep the best
-   pointing.
-3. Pick the exposure length with the best expected score per second, and the program
-   (DARK / BRIGHT / BACKUP) most assigned targets will match.
-
-Everything here uses only the public catalogue, the public scoring config, and the
-agent's own past hits (SurveyState) -- never hidden weather truth. Once per night,
-LLM notice parsing feeds LLM task planning. Their bounded outputs adjust direction
-avoidance, exposure candidates and required-target priorities. Model failures leave
-the deterministic planner in control.
-
-This mirrors the anchor-search algorithm of this project's companion TypeScript
-example target-for-target, so both examples solve the problem the same way.
+Realized scores drive marginal science value. Required completion and feasible
+request windows contribute bounded planning values. Connected LLM notice parsing
+and task planning adjust exposure candidates and priorities at changed conditions.
 """
 from __future__ import annotations
 
 from datetime import timedelta
+import math
 
 from .geometry import (
     Moon,
@@ -42,15 +28,13 @@ from .llm_client import LLMClient
 from .memory import TraceLog
 from .state import PendingPrediction
 from .advice import make_night_plan
+from .calibration import PointingCalibration
 
-DONE_FACTOR = 0.95
 PLAN_FACTOR_SAFETY = 0.9
 EDGE_MARGIN_DEG = 0.08
 DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
-MIN_VISIBLE_SECONDS = 600
 ANCHORS = 6
 ANCHOR_POOL = 300
-CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
@@ -58,37 +42,14 @@ DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
 REPORT_DROP = 0.62
 REPORT_CONFIRMATIONS = 3
 REPORT_SPACING_HOURS = 6.0
-MAX_REPORTS = 2
 
-# Time-limited observation requests (participant guide section 8 / appendix B). There is
-# no penalty for letting one expire -- `observation_requests.miss_penalty` is fixed at 0 --
-# so the only thing worth doing here is not leaving a reachable `completion_reward` on the
-# table, and only when doing so is close to free. Several more aggressive designs were
-# tried and rejected: adding a priority bonus into the normal anchor-search's ranking
-# (_value/achievable), and a separate dedicated exposure pointed straight at an urgent
-# target, both distorted which pointing got chosen and for how long, for a score loss
-# repeatedly far bigger than any request reward across these practice cards -- a public
-# weight scale of ~0.3-1.7 and a 50-60 point REQUIRED_BONUS leave no room for also
-# carrying a "maybe worth 100" incentive without it taking over. What is left is a
-# tie-break, applied only inside _finish_plan's own duration search over a pointing/fibre
-# assignment chosen with ZERO knowledge of requests: among durations within
-# REQUEST_RATE_TOLERANCE of the best expected-score-per-second rate, prefer one that also
-# clears a needed request target's completion_factor_threshold. It can only ever trade a
-# small, bounded amount of rate (never redirect the pointing itself, never reach for a
-# target that is not already going to be exposed anyway) for a chance at the reward.
-REQUEST_RATE_TOLERANCE = 0.9
+
+# Request rewards are shared by the remaining targets of a feasible request.
+# Only exposures entirely inside its public time window can contribute.
 
 
 def _az_distance(a: float, b: float) -> float:
     return abs(wrap180(a - b))
-
-
-def _bulletin_text(notices: list) -> str:
-    """A human-readable rendering of a bulletin's notices, for the LLM call that reads
-    "live bulletin text" rather than structured JSON."""
-    if not notices:
-        return "clear (no active notices)"
-    return "; ".join(f"{n.get('event_kind')} {n.get('direction')}" for n in notices)
 
 
 class Planner:
@@ -96,6 +57,7 @@ class Planner:
         self.state = state
         self.log = log
         self.grid = state.fiber_grid
+        self.calibration = PointingCalibration(self.grid)
         self.clock = Clock()
         self.min_level = 0
         self.llm = LLMClient(log=log)
@@ -103,6 +65,13 @@ class Planner:
 
         self.observe_count = 0
         self.reports = 0
+        self.false_reports = 0
+        self.repairs = 0
+        self.report_pending = False
+        self._request_groups = []
+        self._request_bonus = {}
+        self._last_advice_key = None
+        self._last_advice_night = -100
         self.last_report_hours = float("-inf")
         self.suspicion_hours: list[float] = []
         self.night_index_seen: int | None = None
@@ -134,8 +103,13 @@ class Planner:
             elif message.get("record_type") == "observation_request_result":
                 self.log(f"planner: observation request {message.get('request_id')} "
                          f"{message.get('status')} (reward {message.get('score_delta', 0.0)})")
-        state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
+        if self.calibration.feedback(payload.get("last_result")):
+            self.log(f"planner: calibrated pointing offset={self.calibration.offset}")
+            state.misses = [0] * len(state.ids)
+        # Consume the previous valid exposure before applying a later invalidation.
         state.on_result(payload.get("last_result"), hours)
+        state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
+        self._on_report_result(payload.get("last_result"))
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
@@ -144,6 +118,7 @@ class Planner:
         self._pace(now)
         self._current_action_index = payload.get("observe_action_index")
         self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
+        self._prepare_requests(payload.get("active_requests") or [], now)
 
         night = state.current_night(now)
         if night is None:
@@ -189,6 +164,9 @@ class Planner:
         """Called by agent.py right after an action is validated, so the consecutive-report
         counter (enforced by validation.py) stays correct even when a fallback replaced it."""
         self.consecutive_reports = self.consecutive_reports + 1 if action.get("action") == "report" else 0
+        if action.get("action") != "report":
+            self.report_pending = False  # validation may have replaced a proposed report
+        self.calibration.record(action, self.state.pending, self.state.min_alt)
 
     def _to_next_slot(self, now, night_start) -> int:
         slot = self.state.slot_seconds
@@ -204,10 +182,12 @@ class Planner:
         decisions_left = max(1.0, night_seconds / 700.0)
         per_decision = self.clock.compute_left() / decisions_left
         level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
-        # Safety net from our own measurement: if recent decisions cost more CPU than we
-        # can afford per decision, never go back to a slower level for the rest of the run.
-        if self.clock.avg_cost > per_decision:
-            self.min_level = min(2, max(self.min_level, level + 1))
+        # Reversible pacing with hysteresis; one costly early decision must not
+        # permanently remove the search budget for the remainder of the season.
+        if self.clock.avg_cost > per_decision * 0.9:
+            level = min(2, state.fast_level + 1)
+        elif self.clock.avg_cost > per_decision * 0.35:
+            level = max(level, state.fast_level)
         level = max(level, self.min_level)
         if level != state.fast_level:
             self.log(f"planner: pace level {level} ({per_decision * 1000:.0f} ms CPU per decision left, "
@@ -219,6 +199,14 @@ class Planner:
     def _night_advice(self, night_start, payload: dict) -> None:
         """Parse public notices, then plan; both stages affect bounded planner inputs."""
         night_date = (night_start - timedelta(hours=12)).date().isoformat()
+        relevant = [n for n in self._last_forecast_notices if night_date in (n.get('nights') or [])]
+        key = (tuple(sorted((n.get('event_kind', ''), n.get('direction', ''))
+                            for n in relevant + ((payload.get('latest_bulletin') or {}).get('notices') or []))),
+               tuple(r.get('request_id') for r in payload.get('active_requests') or []))
+        if key == self._last_advice_key and self.night_index_seen - self._last_advice_night < 7:
+            return
+        self._last_advice_key = key
+        self._last_advice_night = self.night_index_seen
         plan = make_night_plan(self.llm, self.state, payload, self._last_forecast_notices,
                                night_date, self.night_index_seen, self.clock.wall_left, self.log)
         self.state.extra_avoid = set(plan['avoid_directions'])
@@ -228,19 +216,37 @@ class Planner:
 
     # -- instrument fault reporting (deterministic rules + LLM confirmation) -----
 
+    def _on_report_result(self, result):
+        if not result or result.get("action") != "report" or not self.report_pending:
+            return
+        self.report_pending = False
+        if result.get("correct") and result.get("repaired"):
+            self.repairs += 1
+            self.false_reports = 0
+            self.state.forget_quality_history()
+        else:
+            self.false_reports += 1
+        self.log(f"planner: report feedback repairs={self.repairs} false_since_repair={self.false_reports}")
+
     def _maybe_report(self, hours: float, payload: dict):
         state = self.state
         state.force_program = None
-        if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 24.0:
+        paid = self.false_reports >= state.false_report_free_allowance
+        cooldown = 72.0 if paid else 24.0
+        if self.report_pending or hours - self.last_report_hours < cooldown:
             return None
         evidence = state.fault_evidence()
-        threshold = REPORT_DROP if self.reports == 0 else REPORT_DROP - 0.07
+        threshold = 0.40 if paid else REPORT_DROP
         if evidence is None or evidence.drop >= threshold:
             self.suspicion_hours = []
             return None
+        # Program band excludes instrument efficiency. Matched DARK observations
+        # during a sustained science-quality collapse corroborate an instrument fault.
         if evidence.dark_checks < 6:
             state.force_program = "DARK"
-        elif evidence.dark_matched < 0.5 * evidence.dark_checks:
+            if paid:
+                return None
+        elif evidence.dark_matched < 0.75 * evidence.dark_checks:
             self.suspicion_hours = []
             return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
@@ -250,22 +256,21 @@ class Planner:
             return None
         self.suspicion_hours = []
         verdict_answer = self.llm.ask_json(
-            "You check telescope data quality. A false instrument-fault report costs points, "
-            'a correct one earns points. Reply with one JSON object only: {"report": true|false}.',
-            evidence._asdict(), self.clock.wall_left,
+            "Check telescope data quality. Program bands exclude instrument efficiency. "
+            'A correct report repairs the instrument; false reports may cost points. '
+            'Reply with JSON only: {"report": true|false}.',
+            {**evidence._asdict(), "false_since_repair": self.false_reports,
+             "free_allowance": state.false_report_free_allowance}, self.clock.wall_left,
         )
-        verdict = verdict_answer.get("report") if isinstance(verdict_answer, dict) and \
-            isinstance(verdict_answer.get("report"), bool) else None
+        verdict = verdict_answer.get("report") if isinstance(verdict_answer, dict) else None
+        self.last_report_hours = hours
         if verdict is False:
-            self.log(f"planner: report vetoed by the model at {payload.get('now_utc')} ({evidence})")
-            self.last_report_hours = hours
             return None
         self.reports += 1
-        self.last_report_hours = hours
-        state.forget_quality_history()
+        self.report_pending = True
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
-        return {"action": "report", "reason": f"quality dropped to {evidence.drop:.0%} of the earlier level",
-                "decision_source": "llm-confirmed" if verdict else "rule"}
+        return {"action": "report", "reason": f"sustained quality drop to {evidence.drop:.0%}",
+                "decision_source": "llm-confirmed" if verdict is True else "rule"}
 
     # -- planning value / achievability -----------------------------------------
 
@@ -293,13 +298,7 @@ class Planner:
         return factor
 
     def _request_thresholds(self, active_requests: list) -> dict:
-        """target_index -> smallest still-needed completion_factor_threshold, for every
-        target that is part of some still-open request (`remaining_count>0`), not
-        already counted (`completed_target_ids`), and not already past that threshold.
-        Used only as a read-only tie-break in _finish_plan's duration search -- it never
-        feeds back into _value/achievable, so it cannot change which pointing gets
-        chosen, only (within REQUEST_RATE_TOLERANCE) how long an already-chosen exposure
-        runs once request targets happen to already be among its assigned fibres."""
+        """Targets still needed in the request window, independent of lifetime factor."""
         state = self.state
         thresholds: dict[int, float] = {}
         for request in active_requests:
@@ -311,24 +310,57 @@ class Planner:
                 if target_id in completed:
                     continue
                 i = state.index_of.get(target_id)
-                if i is None or state.factor[i] >= threshold:
+                if i is None:
                     continue
                 if i not in thresholds or threshold < thresholds[i]:
                     thresholds[i] = threshold
         return thresholds
 
-    def _value(self, i: int) -> float:
-        """Planning value of fully completing target i from here (ignores how much
-        exposure is achievable tonight)."""
+    def _prepare_requests(self, requests, now):
+        self._request_groups = []
+        self._request_bonus = {}
         state = self.state
-        f = state.factor[i]
-        damp = 0.6 ** state.misses[i]
-        threshold = state.scoring.required_threshold
-        if state.required[i]:
-            if f >= threshold:
-                return state.weight[i] * max(0.0, 1.0 - f * f) * damp
-            return (state.weight[i] * (1.0 - f * f) + self.required_bonus * self.required_priority) * damp
-        return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
+        for request in requests:
+            remaining = int(request.get("remaining_count", 0))
+            if remaining <= 0 or not request.get("deadline_utc"):
+                continue
+            deadline = parse_utc(request["deadline_utc"])
+            if now >= deadline or (request.get("issued_at_utc") and now < parse_utc(request["issued_at_utc"])):
+                continue
+            threshold = float(request.get("completion_factor_threshold", 0.5))
+            completed = set(request.get("completed_target_ids") or [])
+            needed = {state.index_of[t] for t in request.get("target_ids", [])
+                      if t in state.index_of and t not in completed}
+            # Necessary feasibility check using all remaining night intervals.
+            available = sum(max(0.0, (min(end, deadline) - max(start, now)).total_seconds())
+                            for start, end in state.nights if end > now and start < deadline)
+            feasible = []
+            lst = local_sidereal_deg(now, state.lon)
+            for i in needed:
+                h = state.hmax[i]
+                ha = wrap180(lst - state.ra[i])
+                seconds = max(state.min_exposure, threshold * state.scoring.f0t0 /
+                              max(1e-9, state.flux[i] * state.scale * PLAN_FACTOR_SAFETY))
+                if h > 0 and seconds <= state.max_exposure and -h <= ha <= h and seconds <= (h-ha) / SIDEREAL_DEG_PER_SECOND:
+                    feasible.append((seconds, i))
+            feasible.sort()
+            if len(feasible) < remaining or sum(t for t, _ in feasible[:remaining]) > available:
+                continue
+            reward = max(0.0, float(request.get("completion_reward", 0)))
+            group = {"targets": {i for _, i in feasible}, "remaining": remaining,
+                     "threshold": threshold, "deadline": deadline, "reward": reward}
+            self._request_groups.append(group)
+            for _, i in feasible:
+                self._request_bonus[i] = self._request_bonus.get(i, 0.0) + 0.65 * reward / remaining
+
+    def _value(self, i: int) -> float:
+        state = self.state
+        top = max(state.scoring.program_multipliers.values())
+        gain = max(0.0, state.weight[i] * top - state.best_score[i])
+        if state.required[i] and state.factor[i] < state.scoring.required_threshold:
+            gain += self.required_bonus * self.required_priority
+        gain += self._request_bonus.get(i, 0.0)
+        return gain * max(0.2, 0.8 ** state.misses[i])
 
     # -- main planning pass -------------------------------------------------------
 
@@ -340,11 +372,11 @@ class Planner:
         seconds_left = (horizon - now).total_seconds()
         if seconds_left < state.min_exposure:
             return None
-        min_visible = min(MIN_VISIBLE_SECONDS, seconds_left) * SIDEREAL_DEG_PER_SECOND
+        min_visible = min(state.min_exposure, seconds_left) * SIDEREAL_DEG_PER_SECOND
 
         still_active = []
         candidates: list[tuple[float, int]] = []
-        for i in state.active:
+        for i in sorted(set(state.active) | set(self._request_bonus)):
             v = self._value(i)
             if v <= 0.0:
                 continue
@@ -386,10 +418,12 @@ class Planner:
             up = (state.hmax[i] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[i] < 180 else 1e9
             reach = min(1.0, k * min(state.max_exposure, up, seconds_left))
             f = state.factor[i]
-            gain = state.weight[i] * max(0.0, reach * reach - f * f)
+            program = scoring.program_band(model * state.band_scale)
+            gain = max(0.0, state.weight[i] * reach * scoring.program_multipliers[program] - state.best_score[i])
+            gain += self._request_bonus.get(i, 0.0) if reach >= self._request_thresholds_now.get(i, 1.0) else 0.0
             if state.required[i] and f < scoring.required_threshold and reach >= scoring.required_threshold:
                 gain += self.required_bonus * self.required_priority
-            damp = (0.6 ** state.misses[i]) * (0.7 ** state.attempts[i])
+            damp = max(0.2, 0.8 ** state.misses[i])
             result = gain * damp * self._direction_factor(alt, az)
             achievable_cache[i] = result
             return result
@@ -409,10 +443,10 @@ class Planner:
         middle = sorted({(self.grid.side - 1) // 2, self.grid.side // 2})
         fibers = range(self.grid.n) if state.fast_level < 2 else tuple(
             row * self.grid.side + col for row in middle for col in middle)
-        best = None  # (total, c_alt, c_az, chosen)
+        fields = []
         tried = 0
         for _, anchor in anchors:
-            if tried >= n_anchors and best is not None:
+            if tried >= n_anchors and fields:
                 break
             if tried >= n_anchors + 8:
                 break
@@ -427,7 +461,7 @@ class Planner:
                     continue
                 c_alt = round(c_alt, 4)
                 c_az = round(c_az, 4) % 360.0
-                chosen: dict[int, tuple[float, int, float]] = {}  # fiber -> (score, j, margin)
+                chosen = {}
                 for j, v in near_values.items():
                     if v <= 0.0:
                         continue
@@ -438,124 +472,105 @@ class Planner:
                     fib, margin = self.grid.classify(*offsets)
                     if fib is None:
                         continue
-                    score = v * (1.0 if margin >= EDGE_MARGIN_DEG * (1 + 1.5 * state.misses[j]) else 0.4)
-                    existing = chosen.get(fib)
-                    if existing is None or score > existing[0]:
-                        chosen[fib] = (score, j, margin)
+                    score = v * (1.0 if margin >= EDGE_MARGIN_DEG else 0.65)
+                    chosen.setdefault(fib, []).append((score, j, margin))
                 if not chosen:
                     continue
-                total = sum(score for score, _, _ in chosen.values())
-                if best is None or total > best[0]:
-                    best = (total, c_alt, c_az, chosen)
-        if best is None:
+                for options in chosen.values():
+                    options.sort(reverse=True)
+                    del options[3:]
+                total = sum(options[0][0] for options in chosen.values())
+                fields.append((total, c_alt, c_az, chosen))
+        if not fields:
             return None
-        _, c_alt, c_az, chosen = best
-        return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index)
+        fields.sort(key=lambda field: -field[0])
+        # Jointly compare a bounded shortlist; do not choose a field before costing
+        # the common duration and program of its actual assignments.
+        plans = []
+        for _, c_alt, c_az, chosen in fields[:(6 if state.fast_level == 0 else 3)]:
+            plan = self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index)
+            if plan is not None:
+                plans.append(plan)
+        if not plans:
+            return None
+        _, action, predictions = max(plans, key=lambda plan: plan[0])
+        alt, az = self.calibration.command(action['pointing']['alt_deg'], action['pointing']['az_deg'])
+        if not (state.min_alt <= alt <= 90.0):
+            return None
+        action['pointing'] = {'alt_deg': round(alt, 4), 'az_deg': round(az, 4) % 360}
+        state.pending = predictions
+        state.pending_action_index = self._current_action_index
+        state.pending_program = action['program']
+        state.pending_duration = action['duration_seconds']
+        state.pending_night = night_index
+        return action
 
     def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index):
-        state = self.state
-        scoring = state.scoring
+        state, scoring = self.state, self.state.scoring
         c_ra, c_dec = altaz_to_radec(c_alt, c_az, lst, state.lat)
         c_hmax = max_hour_angle_deg(c_dec, state.lat, state.min_alt + 0.3)
         c_ha = wrap180(lst - c_ra)
-
-        info: dict[int, dict] = {}
-        for fiber, (_, j, _margin) in chosen.items():
-            alt, az = altaz(j)
-            lunar = lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)
-            model = scoring.quality_model(alt, lunar) or 0.0
-            ha = wrap180(lst - state.ra[j])
-            up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
-            k = (state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY) / scoring.f0t0
-            info[fiber] = {"i": j, "alt": alt, "az": az, "model": model, "up": up, "k": k}
-        center_up = (c_hmax - c_ha) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
-
-        best = None  # (rate, duration)
-        request_best = None  # (rate, duration): best candidate that also clears a needed
-                              # request target's completion_factor_threshold
+        center_up = (c_hmax-c_ha) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
+        limit = min(seconds_left, center_up, state.max_exposure)
+        if limit < state.min_exposure:
+            return None
+        info = {}
+        durations = {state.min_exposure, int(limit)}
         for base in DURATIONS:
-            duration = round((base * state.duration_scale) / 30.0) * 30
-            duration = int(max(state.min_exposure, min(state.max_exposure, duration)))
-            if duration > seconds_left or duration > center_up:
-                continue
-            gain = 0.0
-            completes_request = False
-            for item in info.values():
-                if item["up"] < duration:
-                    continue
-                reached = min(1.0, item["k"] * duration)
-                f = state.factor[item["i"]]
-                gain += state.weight[item["i"]] * max(0.0, reached * reached - f * f)
-                if state.required[item["i"]] and f < scoring.required_threshold and reached >= scoring.required_threshold:
-                    gain += self.required_bonus * self.required_priority
-                threshold = self._request_thresholds_now.get(item["i"])
-                if threshold is not None and reached >= threshold:
-                    completes_request = True
-            rate = gain / duration
-            if best is None or rate > best[0]:
-                best = (rate, duration)
-            if completes_request and (request_best is None or rate > request_best[0]):
-                request_best = (rate, duration)
-        if best is None:
-            return None
-        # Tie-break, not a bonus: duration_seconds is one value shared by all 16 fibres,
-        # so this only ever swaps to a request-completing duration that is already within
-        # REQUEST_RATE_TOLERANCE of the best achievable rate -- it can trade a small,
-        # bounded amount of score for a shot at a reward, never meaningfully distort the
-        # exposure length chosen for everything else in this pointing.
-        if request_best is not None and request_best[0] >= best[0] * REQUEST_RATE_TOLERANCE:
-            best = request_best
-        duration = best[1]
-        if best[0] <= 0.0:
-            if state.has_recent_sample(hours):
-                return None
-            fallback = next((d for d in (900, 600, 300) if d <= seconds_left and d <= center_up), None)
-            if fallback is None:
-                return None
-            duration = fallback
-
-        assignments: dict[str, str] = {}
-        for fiber, item in info.items():
-            if item["up"] >= duration:
-                assignments[str(fiber)] = state.ids[item["i"]]
-        if not assignments:
-            return None
-
-        band_scale = state.scale / 0.95
-        votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
-        for fiber, item in info.items():
-            if str(fiber) not in assignments:
-                continue
-            band = scoring.program_band(item["model"] * band_scale)
-            votes[band] += state.weight[item["i"]] * min(1.0, item["k"] * duration) + \
-                (self.required_bonus * 0.02 if state.required[item["i"]] else 0.0)
-        program, best_score = "BACKUP", float("-inf")
-        for name in ("DARK", "BRIGHT", "BACKUP"):
-            matched = votes[name] * scoring.program_multipliers.get(name, 1.0)
-            mismatched = (votes["DARK"] + votes["BRIGHT"] + votes["BACKUP"] - votes[name]) * scoring.mismatch_multiplier
-            score = matched + mismatched
-            if score > best_score:
-                best_score, program = score, name
-        if state.force_program:
-            program = state.force_program
-
+            durations.add(round(base * state.duration_scale / 30) * 30)
         clean = not state.all_sky_notice()
-        state.pending.clear()
-        state.pending_action_index = self._current_action_index
-        for fiber, item in info.items():
-            if str(fiber) in assignments:
-                state.pending[state.ids[item["i"]]] = PendingPrediction(
-                    model=item["model"], band_model=item["model"] / 0.95, alt=item["alt"], az=item["az"],
-                    clean=clean and self._direction_factor(item["alt"], item["az"]) >= 1.0,
-                )
-        state.pending_program = program
-        state.pending_duration = duration
-        state.pending_night = night_index
-
-        return {
-            "action": "observe",
-            "pointing": {"alt_deg": c_alt, "az_deg": c_az},
-            "assignments": assignments,
-            "duration_seconds": duration,
-            "program": program,
-        }
+        for fiber, options in chosen.items():
+            info[fiber] = []
+            for _, j, margin in options:
+                alt, az = altaz(j)
+                lunar = lunar_factor(moon, state.ra[j], state.dec[j], scoring.lunar_model)
+                model = scoring.quality_model(alt, lunar)
+                up = (state.hmax[j]-wrap180(lst-state.ra[j])) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+                k = state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
+                band = scoring.program_band(model * state.band_scale)
+                item = (j, alt, az, model, up, k, band, margin)
+                info[fiber].append(item)
+                if k > 0:
+                    for threshold in (1.0, scoring.required_threshold if state.required[j] else 1.0,
+                                      self._request_thresholds_now.get(j, 1.0)):
+                        durations.add(math.ceil(threshold / k / 30) * 30)
+                durations.add(int(min(limit, up)))
+        best = None
+        programs = (state.force_program,) if state.force_program else ('DARK', 'BRIGHT', 'BACKUP')
+        for duration in sorted(d for d in durations if state.min_exposure <= d <= limit):
+            for program in programs:
+                assignments, predictions = {}, {}
+                gain = 0.0
+                for fiber, options in info.items():
+                    best_target = None
+                    for item in options:
+                        j, alt, az, model, up, k, band, margin = item
+                        if up < duration:
+                            continue
+                        reached = min(1.0, k * duration)
+                        score = state.weight[j] * reached * scoring.program_multiplier(program, band)
+                        value = max(0.0, score - state.best_score[j])
+                        if state.required[j] and state.factor[j] < scoring.required_threshold <= reached:
+                            value += self.required_bonus * self.required_priority
+                        request_value = sum(0.65 * g['reward'] / g['remaining'] for g in self._request_groups
+                                            if j in g['targets'] and reached >= g['threshold']
+                                            and now + timedelta(seconds=duration) <= g['deadline'])
+                        value += request_value
+                        value *= 1.0 if margin >= EDGE_MARGIN_DEG else 0.65
+                        if best_target is None or value > best_target[0]:
+                            best_target = (value, item, reached)
+                    if best_target is None or best_target[0] <= 0:
+                        continue
+                    value, item, reached = best_target
+                    j, alt, az, model, up, k, band, margin = item
+                    gain += value
+                    assignments[str(fiber)] = state.ids[j]
+                    predictions[state.ids[j]] = PendingPrediction(model, model / 0.95, alt, az,
+                        clean and self._direction_factor(alt, az) >= 1.0)
+                if not assignments:
+                    continue
+                rate = gain / duration
+                if best is None or rate > best[0]:
+                    best = (rate, {'action': 'observe', 'pointing': {'alt_deg': c_alt, 'az_deg': c_az},
+                                  'assignments': assignments, 'duration_seconds': duration, 'program': program}, predictions)
+        return best

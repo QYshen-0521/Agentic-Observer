@@ -21,6 +21,7 @@ agent_core/
   protocol.py             transport: read/write one JSON object per line
   state.py                 SurveyState: catalogue + everything tracked across decisions
   geometry.py              public sky maths (sidereal time, alt/az, fibre grid)
+  calibration.py           fixed pointing offset inferred from public hit feedback
   scoring.py               factor/score estimates from PUBLIC scoring config only
   planner.py               decision logic: wait / observe / report / finish
   llm_client.py            OpenAI-compatible chat client, defaults to Kimi Coding Plan

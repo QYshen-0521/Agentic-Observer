@@ -43,9 +43,25 @@ python tools/official_cli.py --json final show
 Git Bash 下可用 `bash push.sh "提交说明"` 提交并推送，再运行上述 GitHub 提交脚本。
 
 模型变量使用平台已经配置的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。
-只走 OpenAI 兼容的 `/chat/completions` 接口。每晚先解析公开天气公告和预报，
+只走 OpenAI 兼容的 `/chat/completions` 接口。在公告、预报或计划更新时先解析公开信息，
 再依据解析结果、观测进度与临期目标生成受约束的夜间计划；模型失败时退回确定性策略。
-本地无模型验证可设置 `OBSERVER_MODEL_DISABLED=1`。
+本地测试默认启用与平台相同的两阶段模型流程，使用 `agent/.env` 中的私有配置。
+复制 `agent/.env.example` 为 `agent/.env`，填写密钥；Kimi Coding 的默认接口为
+`https://api.kimi.com/coding/v1`，模型标识为 `k3`。密钥文件由 Git 忽略。
+缺少密钥时，本地入口会明确报错。需要无模型对照时使用：
+
+```powershell
+python local_runner.py --card L1 --without-model --out strategy_review_output/iterations/L1-rules
+```
+
+启用模型的本地测试：
+
+```powershell
+python local_runner.py --card L1 --out strategy_review_output/iterations/L1-k3
+```
+
+两种测试都沿用正式 agent 的超时、重试和模型调用上限，详细调用结果见输出目录的 `agent.log`。
+Windows 本地评分器没有平台的容器 CPU 计量，模型等待可能计入预算；本地分数用于策略对照，正式成绩以平台为准。
 
 `agent/agent_core/` 提供天球几何、光纤分配、曝光搜索、实际反馈账本、状态回滚、
 CPU/实际时间预算和统一动作校验。实现以 GOSIM 官网当前 Python 示例为基础；来源与
@@ -55,11 +71,7 @@ CPU/实际时间预算和统一动作校验。实现以 GOSIM 官网当前 Pytho
 保留 V4 策略、回归测试、官方协议文档、本地评测入口和比赛提交工具。
 正式 agent 不读取任何任务卡或隐藏天气文件。密钥、缓存、任务卡和评测输出均不提交 Git。
 
-本地验证、公开测试与正式赛成绩记录在 `strategy_review_output/v4_rebuild/`。
-
-2026-10-05 已完成首次正式 A–D 提交，四卡均计分，平均 24029.60260025。
-首次验证证据见 [V4 重建与首次正式提交](MIGRATION_ZH.md)，该记录中的 ZIP 为历史证据。
-
-最新 GitHub 提交 `52fc3d67` 已完成 A–D 正式评测，平均 22609.22246875，
-并已选为当前最终版本。固定源码、各卡成绩及已观察到的波动见
-[GitHub 提交与工作区清理](GITHUB_SUBMISSION_ZH.md)。
+当前策略与本地对照结果见 [策略说明](STRATEGY_ZH.md)。
+平台版本与提交状态见 [GitHub 提交记录](GITHUB_SUBMISSION_ZH.md)。
+原始成绩、日志与试验快照保存在 Git 忽略的 `strategy_review_output/`，不进入参赛源码。
+旧 V3 审阅报告已清理，迁移历史可以从 Git 历史和保留的正式结果证据查询。
