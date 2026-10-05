@@ -30,6 +30,7 @@ from .state import PendingPrediction
 from .advice import make_night_plan
 from .calibration import PointingCalibration
 from .exposure import ExposureModel
+from .requests import RequestScheduler
 
 PLAN_FACTOR_SAFETY = 0.9
 EDGE_MARGIN_DEG = 0.08
@@ -93,6 +94,9 @@ class Planner:
         self.integrated_quality = True
         self._exposure_model = None
         self._hours = 0.0
+        self.request_scheduler = RequestScheduler(state, self._direction_factor)
+        self.scheduled_requests = True
+        self._science_rate = 0.005
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -121,6 +125,7 @@ class Planner:
             self.log(f"planner: calibrated pointing offset={self.calibration.offset}")
             state.misses = [0] * len(state.ids)
             state.reset_stagnation()
+            state.progress_epoch += 1
         # Consume the previous valid exposure before applying a later invalidation.
         state.on_result(payload.get("last_result"), hours)
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
@@ -134,7 +139,6 @@ class Planner:
         self._pace(now)
         self._current_action_index = payload.get("observe_action_index")
         self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
-        self._prepare_requests(payload.get("active_requests") or [], now)
 
         night = state.current_night(now)
         if night is None:
@@ -158,6 +162,7 @@ class Planner:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
 
+        self._prepare_requests(payload.get("active_requests") or [], now)
         report = self._maybe_report(hours, payload)
         if report is not None:
             return report
@@ -372,6 +377,17 @@ class Planner:
             completed = set(request.get("completed_target_ids") or [])
             needed = {state.index_of[t] for t in request.get("target_ids", [])
                       if t in state.index_of and t not in completed}
+            if self.scheduled_requests:
+                schedule = self.request_scheduler.plan(request, now, self._science_rate)
+                if schedule is None:
+                    continue
+                reward = max(0.0, float(request.get('completion_reward', 0)))
+                group = {'targets':schedule['targets'], 'remaining':remaining,
+                         'threshold':threshold, 'deadline':deadline, 'reward':reward}
+                self._request_groups.append(group)
+                for i in group['targets']:
+                    self._request_bonus[i] = self._request_bonus.get(i, 0.0)+0.65*reward/remaining
+                continue
             # Necessary feasibility check using all remaining night intervals.
             available = sum(max(0.0, (min(end, deadline) - max(start, now)).total_seconds())
                             for start, end in state.nights if end > now and start < deadline)
@@ -567,6 +583,8 @@ class Planner:
         state.pending_program = action['program']
         state.pending_duration = action['duration_seconds']
         state.pending_night = night_index
+        rate = sum(p.expected_gain for p in predictions.values()) / action['duration_seconds']
+        self._science_rate = 0.9*self._science_rate + 0.1*rate
         return action
 
     def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index):

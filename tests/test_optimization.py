@@ -9,6 +9,8 @@ from agent_core.geometry import parse_utc
 from agent_core.planner import Planner
 from agent_core.state import SurveyState, PendingPrediction
 from agent_core.exposure import ExposureModel
+from agent_core.requests import RequestScheduler
+from agent_core.geometry import altaz_to_radec, local_sidereal_deg, shift_altaz, format_utc
 
 
 class PacingTests(unittest.TestCase):
@@ -98,3 +100,55 @@ class ExposureAndYieldTests(unittest.TestCase):
         v = p._value(0)
         s.suppress_stagnation = False
         self.assertEqual(p._value(0), v)
+
+
+class RequestSchedulingTests(unittest.TestCase):
+    def make_request(self, now, ids, need, seconds):
+        return {'request_id':'R1','target_ids':ids,'completed_target_ids':[],
+                'remaining_count':need, 'completion_factor_threshold':.5,
+                'completion_reward':100,'deadline_utc':format_utc(now+timedelta(seconds=seconds))}
+
+    def test_parallel_fibres_fit_when_sum_of_individual_times_does_not(self):
+        data = initial()
+        now = parse_utc(request()['now_utc'])
+        state = SurveyState(data)
+        lst = local_sidereal_deg(now, state.lon)
+        for i in range(2):
+            north,east = state.fiber_grid.fiber_center(i)
+            alt,az = shift_altaz(60,170,north,east)
+            data['targets']['rows'][i][1:3] = altaz_to_radec(alt,az,lst,state.lat)
+            data['targets']['rows'][i][4] = 10
+        s = SurveyState(data)
+        scheduler = RequestScheduler(s, lambda *args:1)
+        plan = scheduler.plan(self.make_request(now,['T0','T1'],2,90), now, .005)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan['targets'],{0,1})
+        self.assertEqual(len(plan['steps']),1)
+
+    def test_future_rising_target_is_scheduled_and_cache_invalidates_on_progress(self):
+        data = initial()
+        now = parse_utc(request()['now_utc'])
+        s = SurveyState(data)
+        lst = local_sidereal_deg(now,s.lon)
+        data['targets']['rows'][0][1] = (lst+s.hmax[0]+15) % 360
+        data['targets']['rows'][0][4] = 10
+        s = SurveyState(data)
+        scheduler = RequestScheduler(s, lambda *args:1)
+        r = self.make_request(now,['T0'],1,6*3600)
+        plan = scheduler.plan(r,now,.005)
+        self.assertIsNotNone(plan)
+        self.assertGreater(plan['next_start'],now)
+        scheduler.plan(r,now+timedelta(seconds=60),.005)
+        self.assertEqual(scheduler.searches,1)
+        s.progress_epoch += 1
+        scheduler.plan(r,now+timedelta(seconds=60),.005)
+        self.assertEqual(scheduler.searches,2)
+
+    def test_deadline_and_opportunity_cost_reject_impossible_request(self):
+        s = SurveyState(initial())
+        scheduler = RequestScheduler(s,lambda *args:1)
+        now = parse_utc(request()['now_utc'])
+        self.assertIsNone(scheduler.plan(self.make_request(now,['T0'],1,10),now,0))
+        r = self.make_request(now,['T0'],1,3600)
+        r['request_id']='expensive'
+        self.assertIsNone(scheduler.plan(r,now,100))

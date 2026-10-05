@@ -148,6 +148,7 @@ class SurveyState:
         self.stagnation = {}
         self.cooldown_until = {}
         self.suppress_stagnation = True
+        self.progress_epoch = 0
         self._cell_ra = {key: [r for r, _ in band] for key, band in self._cells.items()}
 
     # -- spatial index -------------------------------------------------------
@@ -272,6 +273,7 @@ class SurveyState:
         self.pending.clear()
         self.pending_action_index = None
         self.reset_stagnation()
+        self.progress_epoch += 1
 
     def site_closed(self) -> bool:
         for key in self.notices:
@@ -431,6 +433,7 @@ class SurveyState:
         self._all_ratios.clear()
         self.prior_scale = 1.0
         self.reset_stagnation()
+        self.progress_epoch += 1
 
     # -- night lookup -------------------------------------------------------------
 
