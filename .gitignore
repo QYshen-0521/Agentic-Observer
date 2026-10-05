@@ -8,6 +8,7 @@ __pycache__/
 !.env.sample
 !.env.template
 .survey26-cache/
+agent_trace.jsonl
 .DS_Store
 *.pickle
 

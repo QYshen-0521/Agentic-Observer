@@ -32,6 +32,13 @@ python tools/official_cli.py --json eval start <REV> --yes
 python tools/official_cli.py --json eval wait <BATCH> --timeout 1800
 ```
 
+正式评测完成后核查成绩，再选择用于决赛的版本并核对：
+
+```powershell
+python tools/official_cli.py --json final set <REV>
+python tools/official_cli.py --json final show
+```
+
 官方 CLI 自动下载到本地忽略目录 `.survey26-cache/`，沿用本机既有登录。
 Git Bash 下可用 `bash push.sh "提交说明"` 提交并推送，再运行上述 GitHub 提交脚本。
 
@@ -52,3 +59,7 @@ CPU/实际时间预算和统一动作校验。实现以 GOSIM 官网当前 Pytho
 
 2026-10-05 已完成首次正式 A–D 提交，四卡均计分，平均 24029.60260025。
 首次验证证据见 [V4 重建与首次正式提交](MIGRATION_ZH.md)，该记录中的 ZIP 为历史证据。
+
+最新 GitHub 提交 `52fc3d67` 已完成 A–D 正式评测，平均 22609.22246875，
+并已选为当前最终版本。固定源码、各卡成绩及已观察到的波动见
+[GitHub 提交与工作区清理](GITHUB_SUBMISSION_ZH.md)。
