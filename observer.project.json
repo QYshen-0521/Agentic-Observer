@@ -1,6 +1,3 @@
 {
-  "schema_version": "observer-project-v1",
-  "entry_point": "minimal_agent.py",
-  "adapter": "none",
-  "description": "GOSIM Survey26 Agentic Observer - no auto adaptation"
+  "schema_version": "observer-project-v1"
 }

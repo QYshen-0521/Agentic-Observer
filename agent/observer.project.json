@@ -1,5 +1,0 @@
-{
-  "schema_version": "observer-project-v1",
-  "entry_point": "minimal_agent.py",
-  "adapter": "none"
-}
