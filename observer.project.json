@@ -1,8 +1,9 @@
 {
   "schema_version": "observer-project-v1",
-  "project_type": "agent",
   "entry_point": "agent/minimal_agent.py",
   "agent_directory": "agent/",
   "requirements": "agent/requirements.txt",
+  "skip_auto_adaptation": true,
+  "protocol": "participant-agent-protocol-v2",
   "description": "GOSIM Survey26 Agentic Observer - LLM-enhanced scheduling strategy"
 }
