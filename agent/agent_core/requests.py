@@ -31,6 +31,8 @@ class RequestScheduler:
         if now < self.failed.get((request.get('request_id'), key), now):
             return None
         self.searches += 1
+        if len(self.failed) > 128:
+            self.failed = {k:v for k,v in self.failed.items() if v > now}
         if len(ids) < need or need > 8:
             self.failed[(request.get('request_id'), key)] = now+timedelta(seconds=s.slot_seconds)
             return None

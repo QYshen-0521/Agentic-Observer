@@ -51,8 +51,29 @@ class PacingTests(unittest.TestCase):
         c.observe_progress(now+timedelta(days=1), nights)
         self.assertEqual(c.decisions_left(600), 10)
 
+    def test_one_off_request_cost_does_not_poison_search_cost(self):
+        c = Clock()
+        with patch('agent_core.clock.time.process_time',side_effect=[0,1,1,1.012,1.012,1.024]), \
+             patch('agent_core.clock.time.monotonic',side_effect=[0,1,1,1.012,1.012,1.024]):
+            c.level = 0
+            c.start_decision()
+            c.last_search_cost = .02
+            c.end_decision()
+            for _ in range(2):
+                c.level = 2
+                c.start_decision()
+                c.last_search_cost = .01
+                c.end_decision()
+        self.assertLess(c.level_cost[0],.03)
+
 
 class ExposureAndYieldTests(unittest.TestCase):
+    def test_resync_gain_reflects_removed_scores(self):
+        s = SurveyState(initial())
+        s.best_score[0] = .5
+        s.on_result(None,0)
+        s.on_messages([{'record_type':'state_resync','best_scores':[]}],None)
+        self.assertAlmostEqual(s.last_science_gain,-.5)
     def test_integration_splits_at_public_slot_boundaries(self):
         s = SurveyState(initial())
         start = parse_utc(request()['now_utc'])

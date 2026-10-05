@@ -238,6 +238,7 @@ class SurveyState:
 
     def _resync(self, message: dict) -> None:
         """Rollback score and factor bounds using valid exposure history and public resync."""
+        previous_score = sum(self.best_score)
         window = message.get("invalidated_window") or {}
         start, end = window.get("action_index_start"), window.get("action_index_end_exclusive")
         if start is not None and end is not None:
@@ -272,6 +273,7 @@ class SurveyState:
         self.active = [i for i in range(len(self.ids)) if self.hmax[i] > 0.0]
         self.pending.clear()
         self.pending_action_index = None
+        self.last_science_gain += sum(self.best_score)-previous_score
         self.reset_stagnation()
         self.progress_epoch += 1
 
