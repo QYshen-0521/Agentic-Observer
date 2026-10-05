@@ -28,6 +28,7 @@ ACCEPTED_INITIAL_PUBLICATION_VERSIONS = (
     "initial-publication-v2",
     "initial-publication-v3",
     "initial-publication-v4",
+    "initial-publication-v5",
 )
 
 
