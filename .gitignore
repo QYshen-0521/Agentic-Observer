@@ -1,0 +1,21 @@
+.optimizer-venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.DS_Store
+*.pickle
+
+# Local runner and experiment outputs
+demo_week_output/
+run_output/
+strategy_*_output/
+strategy_*_output_*/
+candidate_*.csv
+challenger_*.csv
+leaderboard_*.csv
+optimized_*.csv
+screen_*.csv
+playground_upload*
+*_score_report.json
+score_report.json
