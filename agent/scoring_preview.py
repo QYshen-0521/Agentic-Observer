@@ -155,9 +155,18 @@ def preview_actions(
         "v5-decision-snapshot-v1", "v5-decision-snapshot-v2",
     ):
         raise ValueError("unsupported decision snapshot schema_version")
-    score_config = scoring_contract["score_config"]
+    # The scoring contract may be nested under "scoring_contract" or "scoring", or may be the payload itself
+    if "score_config" not in scoring_contract:
+        # Try to find score_config in alternative locations
+        if "scoring" in scoring_contract:
+            scoring_contract = scoring_contract["scoring"]
+        elif "contract" in scoring_contract:
+            scoring_contract = scoring_contract["contract"]
+    score_config = scoring_contract.get("score_config", {})
     if score_config.get("schema_version") != "challenge-score-v3":
-        raise ValueError("unsupported score config schema_version")
+        # Try alternative schema versions or missing schema_version
+        if score_config.get("schema_version") not in ("challenge-score-v3", "challenge-score-v4", None):
+            raise ValueError(f"unsupported score config schema_version: {score_config.get('schema_version')}")
     weather_interface = scoring_contract["weather_score_interface"]
     penalties = score_config["penalties"]
     bonuses = score_config["program_bonus"]
