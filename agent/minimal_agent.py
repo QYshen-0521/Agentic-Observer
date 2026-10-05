@@ -14,8 +14,9 @@ if sys.version_info < (3, 9):
 
 
 AGENT_DIR = Path(__file__).resolve().parent
-# scoring_preview.py ships next to this file in the starter kit; on the platform it lives one level up.
-for _candidate in (AGENT_DIR, AGENT_DIR.parent):
+# On the platform, the adapter may run from .observer-adapter/ while the agent files
+# live in the workspace root or in agent/. Add all plausible locations to sys.path.
+for _candidate in (AGENT_DIR, AGENT_DIR.parent, Path("/workspace"), Path("/workspace/agent")):
     if (_candidate / "scoring_preview.py").exists() and str(_candidate) not in sys.path:
         sys.path.insert(0, str(_candidate))
 
