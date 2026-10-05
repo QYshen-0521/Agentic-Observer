@@ -1,3 +1,15 @@
 {
-  "schema_version": "observer-project-v1"
+  "schema_version": "observer-project-v1",
+  "entry_point": "agent/minimal_agent.py",
+  "agent_directory": "agent",
+  "requirements": "agent/requirements.txt",
+  "adapter": {
+    "type": "none",
+    "skip_auto_adaptation": true
+  },
+  "protocol": {
+    "version": "participant-agent-protocol-v2",
+    "initialize_schema": "initial-publication-v2",
+    "snapshot_schema": "decision-snapshot-v3"
+  }
 }
