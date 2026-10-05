@@ -30,6 +30,7 @@ class PendingPrediction(NamedTuple):
     alt: float
     az: float
     clean: bool            # true when no all-sky notice / directional block applied at plan time
+    expected_gain: float = 0.0  # predicted SCIENCE increment, excluding request/required value
 
 
 class FaultEvidence(NamedTuple):
@@ -143,6 +144,10 @@ class SurveyState:
         # ambiguous. Never label an estimate as the backend's exact completion factor.
         self.ledger: list[ExposureRecord] = []
         self.pending_action_index: Optional[int] = None
+        self.last_science_gain = 0.0
+        self.stagnation = {}
+        self.cooldown_until = {}
+        self.suppress_stagnation = True
         self._cell_ra = {key: [r for r, _ in band] for key, band in self._cells.items()}
 
     # -- spatial index -------------------------------------------------------
@@ -209,6 +214,7 @@ class SurveyState:
     # -- messages and results -------------------------------------------------
 
     def on_messages(self, messages: list[dict], latest_bulletin: Optional[dict]) -> None:
+        old_notices = self.notices
         for message in messages:
             if message.get("record_type") == "bulletin" and message.get("initial"):
                 for notice in message.get("notices", []):
@@ -219,6 +225,15 @@ class SurveyState:
         notices = (latest_bulletin or {}).get("notices", [])
         self.notices = {f"{n.get('event_kind')}|{n.get('direction')}" for n in notices
                         if n.get("event_kind") != "terrain_obstruction"}
+        if old_notices != self.notices:
+            self.reset_stagnation()
+
+    def reset_stagnation(self):
+        self.stagnation.clear()
+        self.cooldown_until.clear()
+
+    def science_weight(self, i, hours):
+        return 0.1 if self.suppress_stagnation and hours < self.cooldown_until.get(i, -1.0) else 1.0
 
     def _resync(self, message: dict) -> None:
         """Rollback score and factor bounds using valid exposure history and public resync."""
@@ -256,6 +271,7 @@ class SurveyState:
         self.active = [i for i in range(len(self.ids)) if self.hmax[i] > 0.0]
         self.pending.clear()
         self.pending_action_index = None
+        self.reset_stagnation()
 
     def site_closed(self) -> bool:
         for key in self.notices:
@@ -268,6 +284,7 @@ class SurveyState:
         return any(key.partition("|")[2] == "ALL" for key in self.notices)
 
     def on_result(self, last_result: Optional[dict], hours: float) -> None:
+        self.last_science_gain = 0.0
         action_index = self.pending_action_index
         self.pending_action_index = None
         if not last_result or last_result.get("action") != "observe" or not self.pending:
@@ -283,10 +300,23 @@ class SurveyState:
 
         exposure_ratios = []
         clean_ratios = []
+        matched_models = []
+        clean_models = []
         for target_id, prediction in self.pending.items():
             i = self.index_of.get(target_id)
             if i is None:
                 continue
+            score = hits.get(target_id, 0.0)
+            gain = max(0.0, score - self.best_score[i])
+            self.last_science_gain += gain
+            if prediction.expected_gain > 1e-9:
+                streak = self.stagnation.get(i, 0) + 1 if gain < 0.1 * prediction.expected_gain else 0
+                self.stagnation[i] = streak
+                if streak >= 3:
+                    self.cooldown_until[i] = hours + 2.0
+                    self.stagnation[i] = 0
+            if prediction.clean:
+                clean_models.append(prediction.band_model)
             if target_id not in hits:
                 self.misses[i] += 1
                 continue
@@ -307,7 +337,7 @@ class SurveyState:
             factor = min(1.0, min(possible))
             upper = min(1.0, max(possible))
             if prediction.clean and multiplier_seen > mismatch + 2e-4:
-                self._band_checks.append((hours, self.pending_program, True, prediction.model))
+                matched_models.append(prediction.band_model)
             self.factor[i] = max(self.factor[i], factor)
             self.factor_high[i] = max(self.factor_high[i], upper)
             if action_index is not None:
@@ -326,6 +356,12 @@ class SurveyState:
             self._all_ratios.append(ratio)
         if clean_ratios:
             self.clean_history.append((hours, self.pending_night, statistics.median(clean_ratios)))
+        if clean_models:
+            # One independent exposure, including UNKNOWN outcomes. A low score
+            # cannot prove a mismatch: instrument efficiency is not observable.
+            self._band_checks.append((hours, self.pending_program, bool(matched_models),
+                                      statistics.median(matched_models or clean_models)))
+        self._update_band_scale(hours)
         self.pending.clear()
         self.update_scale(hours)
 
@@ -338,9 +374,25 @@ class SurveyState:
             self.prior_scale = ordered[len(ordered) // 2]
         recent = sorted(ratio for when, ratio in self._samples if when >= hours - SKY_MEMORY_HOURS)
         self.scale = max(0.05, recent[len(recent) // 2]) if len(recent) >= 4 else self.prior_scale
-        # Do not automatically interpret an efficiency collapse as a new program band.
-        if self.scale >= 0.65 * self.band_scale:
-            self.band_scale = 0.9 * self.band_scale + 0.1 * self.scale / 0.95
+        # Science scale includes instrument efficiency. Band scale is constrained
+        # separately by confirmed program matches, never by a quality collapse.
+
+    def _update_band_scale(self, hours):
+        lower, upper = [], []
+        for when, program, confirmed, model in self._band_checks:
+            if not confirmed or when < hours - SKY_MEMORY_HOURS or model <= 0:
+                continue
+            if program == 'DARK':
+                lower.append(self.scoring.program_bands['DARK'] / model)
+            elif program == 'BRIGHT':
+                lower.append(self.scoring.program_bands['BRIGHT'] / model)
+                upper.append(self.scoring.program_bands['DARK'] / model)
+            else:
+                upper.append(self.scoring.program_bands['BRIGHT'] / model)
+        lo = statistics.median(lower) if lower else 0.05
+        hi = statistics.median(upper) if upper else 2.0
+        if lo <= hi:
+            self.band_scale = min(hi, max(lo, self.band_scale))
 
     # -- fault diagnostics ------------------------------------------------------
 
@@ -360,7 +412,7 @@ class SurveyState:
         earlier_median = earlier_sorted[len(earlier_sorted) // 2]
         dark_line = self.scoring.program_bands["DARK"] * 1.3
         dark = [c for c in list(self._band_checks)[-16:]
-                if c[0] >= recent[0][0] and c[1] == "DARK" and (c[3] * earlier_median) / 0.95 >= dark_line]
+                if c[0] >= recent[0][0] and c[1] == "DARK" and c[3] * self.band_scale >= dark_line]
         return FaultEvidence(
             recent_median=round(recent_median, 3),
             earlier_median=round(earlier_median, 3),
@@ -378,6 +430,7 @@ class SurveyState:
         self._samples.clear()
         self._all_ratios.clear()
         self.prior_scale = 1.0
+        self.reset_stagnation()
 
     # -- night lookup -------------------------------------------------------------
 

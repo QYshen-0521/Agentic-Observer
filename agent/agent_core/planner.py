@@ -29,6 +29,7 @@ from .memory import TraceLog
 from .state import PendingPrediction
 from .advice import make_night_plan
 from .calibration import PointingCalibration
+from .exposure import ExposureModel
 
 PLAN_FACTOR_SAFETY = 0.9
 EDGE_MARGIN_DEG = 0.08
@@ -89,6 +90,9 @@ class Planner:
         self._recovery_rounds = 0
         self._pace_estimate = {}
         self.adaptive_pacing = True
+        self.integrated_quality = True
+        self._exposure_model = None
+        self._hours = 0.0
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -99,6 +103,7 @@ class Planner:
         state = self.state
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
+        self._hours = hours
         self._decision_values = None
         self._decision_models = None
         self._model_wait_start = getattr(self.llm, 'wait_used', 0.0)
@@ -115,6 +120,7 @@ class Planner:
         if self.calibration.feedback(payload.get("last_result")):
             self.log(f"planner: calibrated pointing offset={self.calibration.offset}")
             state.misses = [0] * len(state.ids)
+            state.reset_stagnation()
         # Consume the previous valid exposure before applying a later invalidation.
         state.on_result(payload.get("last_result"), hours)
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
@@ -277,11 +283,11 @@ class Planner:
             return None
         # Program band excludes instrument efficiency. Matched DARK observations
         # during a sustained science-quality collapse corroborate an instrument fault.
-        if evidence.dark_checks < 6:
+        if evidence.dark_matched < 6:
             state.force_program = "DARK"
             if paid:
                 return None
-        elif evidence.dark_matched < 0.75 * evidence.dark_checks:
+        if paid and evidence.recent_nights < 2:
             self.suspicion_hours = []
             return None
         if self.suspicion_hours and hours - self.suspicion_hours[-1] < REPORT_SPACING_HOURS:
@@ -394,6 +400,9 @@ class Planner:
         state = self.state
         top = max(state.scoring.program_multipliers.values())
         gain = max(0.0, state.weight[i] * top - state.best_score[i])
+        exempt = (state.required[i] and state.factor[i] < state.scoring.required_threshold) or i in self._request_bonus
+        if not exempt:
+            gain *= state.science_weight(i, self._hours)
         if state.required[i] and state.factor[i] < state.scoring.required_threshold:
             gain += self.required_bonus * self.required_priority
         gain += self._request_bonus.get(i, 0.0)
@@ -422,6 +431,8 @@ class Planner:
         self._decision_models = {}
         state.update_scale(hours)
         lst = local_sidereal_deg(now, state.lon)
+        night_start = state.nights[night_index][0]
+        self._exposure_model = ExposureModel(state, now, lst, night_start) if self.integrated_quality else None
         horizon = min(night_end, state.survey_end)
         seconds_left = (horizon - now).total_seconds()
         if seconds_left < state.min_exposure:
@@ -590,6 +601,17 @@ class Planner:
         best = None
         programs = (state.force_program,) if state.force_program else ('DARK', 'BRIGHT', 'BACKUP')
         for duration in sorted(d for d in durations if state.min_exposure <= d <= limit):
+            exposure_values = {}
+            for options in info.values():
+                for item in options:
+                    j, alt, az, model, up, k, band, margin = item
+                    if up < duration:
+                        continue
+                    if self._exposure_model is not None:
+                        model = self._exposure_model.average(j, duration)
+                        k = state.flux[j] * model * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
+                        band = scoring.program_band(model * state.band_scale / 0.95)
+                    exposure_values[j] = (model, k, band)
             for program in programs:
                 assignments, predictions = {}, {}
                 gain = 0.0
@@ -599,9 +621,13 @@ class Planner:
                         j, alt, az, model, up, k, band, margin = item
                         if up < duration:
                             continue
+                        model, k, band = exposure_values[j]
                         reached = min(1.0, k * duration)
                         score = state.weight[j] * reached * scoring.program_multiplier(program, band)
                         value = max(0.0, score - state.best_score[j])
+                        exempt = (state.required[j] and state.factor[j] < scoring.required_threshold) or j in self._request_bonus
+                        if not exempt:
+                            value *= state.science_weight(j, hours)
                         if state.required[j] and state.factor[j] < scoring.required_threshold <= reached:
                             value += self.required_bonus * self.required_priority
                         request_value = sum(0.65 * g['reward'] / g['remaining'] for g in self._request_groups
@@ -610,15 +636,16 @@ class Planner:
                         value += request_value
                         value *= 1.0 if margin >= EDGE_MARGIN_DEG else 0.65
                         if best_target is None or value > best_target[0]:
-                            best_target = (value, item, reached)
+                            best_target = (value, item, reached, model, score)
                     if best_target is None or best_target[0] <= 0:
                         continue
-                    value, item, reached = best_target
+                    value, item, reached, integrated_model, score = best_target
                     j, alt, az, model, up, k, band, margin = item
                     gain += value
                     assignments[str(fiber)] = state.ids[j]
-                    predictions[state.ids[j]] = PendingPrediction(model, model / 0.95, alt, az,
-                        clean and self._direction_factor(alt, az) >= 1.0)
+                    predictions[state.ids[j]] = PendingPrediction(integrated_model, integrated_model / 0.95, alt, az,
+                        clean and self._direction_factor(alt, az) >= 1.0,
+                        max(0.0, score-state.best_score[j]))
                 if not assignments:
                     continue
                 rate = gain / duration
