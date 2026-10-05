@@ -7,6 +7,7 @@ and task planning adjust exposure candidates and priorities at changed condition
 from __future__ import annotations
 
 from datetime import timedelta
+from collections import OrderedDict
 import math
 
 from .geometry import (
@@ -97,6 +98,7 @@ class Planner:
         self.request_scheduler = RequestScheduler(state, self._direction_factor)
         self.scheduled_requests = True
         self._science_rate = 0.005
+        self._advice_cache = OrderedDict()
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -148,9 +150,8 @@ class Planner:
             return {"action": "wait", "until_utc": format_utc(nxt), "reason": "daytime: sleep until the next night"}
         night_index, night_start, night_end = night
 
-        if self.night_index_seen != night_index:
-            self.night_index_seen = night_index
-            self._night_advice(night_start, payload)
+        self.night_index_seen = night_index
+        self._night_advice(night_start, payload)
 
         if (night_end - now).total_seconds() < state.min_exposure:
             nxt = state.next_night_start(now)
@@ -248,13 +249,34 @@ class Planner:
         relevant = [n for n in self._last_forecast_notices if night_date in (n.get('nights') or [])]
         key = (tuple(sorted((n.get('event_kind', ''), n.get('direction', ''))
                             for n in relevant + ((payload.get('latest_bulletin') or {}).get('notices') or []))),
-               tuple(r.get('request_id') for r in payload.get('active_requests') or []))
+               tuple((r.get('request_id'),r.get('remaining_count'),r.get('deadline_utc'))
+                     for r in payload.get('active_requests') or []))
         if key == self._last_advice_key and self.night_index_seen - self._last_advice_night < 7:
             return
         self._last_advice_key = key
         self._last_advice_night = self.night_index_seen
-        plan = make_night_plan(self.llm, self.state, payload, self._last_forecast_notices,
-                               night_date, self.night_index_seen, self.clock.wall_left, self.log)
+        cached = self._advice_cache.get(key)
+        can_pair = not hasattr(self.llm,'begin_pair') or self.llm.begin_pair(self.clock.wall_left)
+        if can_pair:
+            try:
+                plan = make_night_plan(self.llm, self.state, payload, self._last_forecast_notices,
+                    night_date, self.night_index_seen, self.clock.wall_left, self.log, cached)
+            finally:
+                if hasattr(self.llm,'end_pair'):
+                    self.llm.end_pair()
+            if plan['parsing_ok'] or plan['planning_ok']:
+                self._advice_cache[key] = plan
+                if len(self._advice_cache) > 16:
+                    self._advice_cache.popitem(last=False)
+        elif cached:
+            plan = cached
+        else:
+            # Re-ground changed conditions without attempting either network stage.
+            grounded = {n.get('direction') for n in relevant+
+                        ((payload.get('latest_bulletin') or {}).get('notices') or [])
+                        if n.get('direction') in DIRECTION_AZ}
+            plan = {'avoid_directions':sorted(grounded), 'duration_scale':1.0,
+                    'required_priority':1.0,'parsing_ok':False,'planning_ok':False}
         self.state.extra_avoid = set(plan['avoid_directions'])
         self.state.duration_scale = plan['duration_scale']
         self.required_priority = plan['required_priority']

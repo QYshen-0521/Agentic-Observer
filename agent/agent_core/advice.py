@@ -19,7 +19,7 @@ def valid_directions(value, grounded: set[str]) -> list[str]:
         return []
     return sorted({v for v in value if isinstance(v, str) and v in DIRECTIONS & grounded})
 
-def make_night_plan(llm, state, payload, forecast, night_date, night_index, wall_left, log):
+def make_night_plan(llm, state, payload, forecast, night_date, night_index, wall_left, log, cached=None):
     notices = (payload.get('latest_bulletin') or {}).get('notices') or []
     relevant = [n for n in forecast if night_date in (n.get('nights') or [])]
     grounded = {n.get('direction') for n in notices + relevant if n.get('direction') in DIRECTIONS}
@@ -33,8 +33,9 @@ def make_night_plan(llm, state, payload, forecast, night_date, night_index, wall
          'forecast_notices': relevant}, wall_left,
     )
     parsed = parsed if isinstance(parsed, dict) else {}
-    weather = {'avoid_directions': valid_directions(parsed.get('avoid_directions'), grounded),
-               'duration_scale': bounded_number(parsed.get('duration_scale'), 1.0, 0.7, 1.4)}
+    cached = cached or {}
+    weather = {'avoid_directions': valid_directions(parsed.get('avoid_directions', cached.get('avoid_directions')), grounded),
+               'duration_scale': bounded_number(parsed.get('duration_scale'), cached.get('weather_duration_scale',1.0), 0.7, 1.4)}
     log(f"llm-stage notice_parsing: {'ok' if parsed else 'fallback'} {weather}")
     required_remaining = sum(required and factor < state.scoring.required_threshold
                              for required, factor in zip(state.required, state.factor))
@@ -57,10 +58,12 @@ def make_night_plan(llm, state, payload, forecast, night_date, night_index, wall
          'learned_quality_scale': state.scale}, wall_left,
     )
     planned = planned if isinstance(planned, dict) else {}
+    planning_scale = bounded_number(planned.get('duration_scale'),cached.get('planning_duration_scale',1.0),.85,1.15)
     plan = {'avoid_directions': weather['avoid_directions'],
             'duration_scale': bounded_number(weather['duration_scale'] * bounded_number(
-                planned.get('duration_scale'), 1.0, 0.85, 1.15), 1.0, 0.7, 1.4),
-            'required_priority': bounded_number(planned.get('required_priority'), 1.0, 1.0, 1.5),
+                planning_scale, 1.0, 0.85, 1.15), 1.0, 0.7, 1.4),
+            'required_priority': bounded_number(planned.get('required_priority'), cached.get('required_priority',1.0), 1.0, 1.5),
+            'weather_duration_scale':weather['duration_scale'], 'planning_duration_scale':planning_scale,
             'parsing_ok': bool(parsed), 'planning_ok': bool(planned)}
     log(f"llm-stage night_planning: {'ok' if planned else 'fallback'} {plan}")
     return plan

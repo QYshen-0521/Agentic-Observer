@@ -11,6 +11,9 @@ from agent_core.state import SurveyState, PendingPrediction
 from agent_core.exposure import ExposureModel
 from agent_core.requests import RequestScheduler
 from agent_core.geometry import altaz_to_radec, local_sidereal_deg, shift_altaz, format_utc
+from agent_core.llm_client import LLMClient
+from agent_core.state import FaultEvidence
+import os
 
 
 class PacingTests(unittest.TestCase):
@@ -152,3 +155,54 @@ class RequestSchedulingTests(unittest.TestCase):
         r = self.make_request(now,['T0'],1,3600)
         r['request_id']='expensive'
         self.assertIsNone(scheduler.plan(r,now,100))
+
+
+class AdviceAndFaultTests(unittest.TestCase):
+    def test_pair_reserves_second_stage_and_limits_each_question(self):
+        with patch.dict(os.environ,{'OPENAI_API_KEY':'fake','OBSERVER_MODEL_DISABLED':'0'}):
+            client = LLMClient(max_calls=2)
+            self.assertTrue(client.begin_pair(1800))
+            with patch.object(client,'_attempt',return_value={'ok':True}) as attempt:
+                client.ask_json('first',{},1800)
+                client.ask_json('second',{},1800)
+            self.assertEqual(client.calls_made,2)
+            self.assertTrue(all(call.args[2] <= 12.01 for call in attempt.call_args_list))
+            client.end_pair()
+            self.assertFalse(client.begin_pair(1800))
+
+    def test_exhausted_budget_preserves_same_context_and_regrounds_changed_weather(self):
+        p = Planner(SurveyState(initial()))
+        class Fake:
+            enabled = True
+            def begin_pair(self, left):return self.enabled
+            def end_pair(self):pass
+            def ask_json(self, system, data, left):
+                return {'avoid_directions':['NE'],'duration_scale':1.1,'required_priority':1.4}
+        p.llm = Fake()
+        payload = request()
+        payload['latest_bulletin'] = {'notices':[{'event_kind':'cloud','direction':'NE'}]}
+        p.night_index_seen = 0
+        start = parse_utc(payload['now_utc'])
+        p._night_advice(start,payload)
+        old = (p.state.duration_scale,p.required_priority)
+        p.llm.enabled = False
+        p._last_advice_night = -100
+        p._night_advice(start,payload)
+        self.assertEqual((p.state.duration_scale,p.required_priority),old)
+        payload['latest_bulletin'] = {'notices':[{'event_kind':'cloud','direction':'S'}]}
+        p._night_advice(start,payload)
+        self.assertEqual(p.state.extra_avoid,{'S'})
+        self.assertEqual(p.state.duration_scale,1)
+
+    def test_paid_report_requires_two_nights_and_six_confirmed_exposures(self):
+        p = Planner(SurveyState(initial()))
+        p.false_reports = 2
+        p.llm.ask_json = lambda *args:None
+        for nights,confirmed in [(1,6),(2,5)]:
+            p.state.fault_evidence = lambda:FaultEvidence(.2,1,.2,12,nights,24,12,confirmed)
+            for hours in (80,87,94):
+                self.assertIsNone(p._maybe_report(hours,request()))
+        p.state.fault_evidence = lambda:FaultEvidence(.2,1,.2,12,2,24,12,6)
+        for hours in (100,107,114):
+            result = p._maybe_report(hours,request())
+        self.assertEqual(result['action'],'report')

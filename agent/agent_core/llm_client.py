@@ -89,6 +89,25 @@ class LLMClient:
         self.calls_made = 0
         self.wait_used = 0.0
         self.max_wait_seconds = 180.0
+        self._pair_deadline = None
+        self._pair_questions = 0
+        self._pair_question_cap = 0.0
+
+    def begin_pair(self, wall_left_seconds):
+        """Allocate both connected stages together, reserving future refresh time."""
+        available = self.max_wait_seconds - self.wait_used
+        if self.disabled or self.max_calls-self.calls_made < 2 or available < 8 or wall_left_seconds <= WALL_RESERVE_SECONDS+8:
+            return False
+        reserve = min(30.0, available*.25)
+        budget = min(24.0, available-reserve, wall_left_seconds-WALL_RESERVE_SECONDS)
+        self._pair_deadline = time.monotonic()+budget
+        self._pair_question_cap = budget/2.0
+        self._pair_questions = 2
+        return True
+
+    def end_pair(self):
+        self._pair_deadline = None
+        self._pair_questions = 0
 
     def _attempt(self, system_prompt: str, user_payload: dict, timeout: float) -> dict:
         """One HTTP attempt. Raises RetryableError for problems worth retrying, any other
@@ -132,6 +151,8 @@ class LLMClient:
             return self._ask_json(system_prompt, user_payload, wall_left_seconds)
         finally:
             self.wait_used += time.monotonic() - started
+            if self._pair_questions:
+                self._pair_questions -= 1
 
     def _ask_json(self, system_prompt: str, user_payload: dict, wall_left_seconds: float) -> Optional[dict]:
         """One planning question, answered as exactly one JSON object, or None so the
@@ -141,12 +162,16 @@ class LLMClient:
             return None
         deadline = time.monotonic() + min(QUESTION_DEADLINE_SECONDS, wall_left_seconds - WALL_RESERVE_SECONDS,
                                          self.max_wait_seconds - self.wait_used)
+        if self._pair_deadline is not None:
+            now = time.monotonic()
+            deadline = min(deadline, self._pair_deadline, now+self._pair_question_cap)
         for attempt in range(1, self.max_attempts + 1):
             time_left = deadline - time.monotonic()
             if time_left < 2.0:
                 self.log("llm: no time left for this question; using the rule-based path")
                 return None
-            if self.calls_made >= self.max_calls:
+            reserved_call = 1 if self._pair_questions == 2 else 0
+            if self.calls_made >= self.max_calls-reserved_call:
                 self.log("llm: call cap reached for this run; using the rule-based path")
                 return None
             self.calls_made += 1
