@@ -311,11 +311,14 @@ def _deterministic_choice(candidates, snapshot, memory, now):
 # ---------------------------------------------------------------------------
 
 def _llm_available():
-    """Check whether LLM credentials are configured."""
-    return bool(
-        os.environ.get("MOONSHOT_API_KEY")
-        and os.environ.get("MODEL_NAME")
-    )
+    """Check whether LLM credentials are configured (supports both OPENAI_* and MOONSHOT_*)."""
+    # Platform style: OPENAI_API_KEY / OPENAI_MODEL
+    if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_MODEL"):
+        return True
+    # Local style: MOONSHOT_API_KEY / MODEL_NAME
+    if os.environ.get("MOONSHOT_API_KEY") and os.environ.get("MODEL_NAME"):
+        return True
+    return False
 
 
 def _call_llm(prompt, system_prompt="You are an expert telescope scheduling assistant."):
@@ -326,9 +329,19 @@ def _call_llm(prompt, system_prompt="You are an expert telescope scheduling assi
         print("openai package not installed; LLM disabled", file=sys.stderr, flush=True)
         return None
 
-    api_key = os.environ.get("MOONSHOT_API_KEY", "").strip()
-    base_url = os.environ.get("MODEL_BASE_URL", "https://api.moonshot.cn/v1").strip()
-    model = os.environ.get("MODEL_NAME", "kimi-k2-0711-preview").strip()
+    # Priority 1: Platform OPENAI_* variables
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+    model = os.environ.get("OPENAI_MODEL", "").strip()
+
+    # Priority 2: Local MOONSHOT_* variables
+    if not api_key:
+        api_key = os.environ.get("MOONSHOT_API_KEY", "").strip()
+    if not base_url:
+        base_url = os.environ.get("MODEL_BASE_URL", "https://api.moonshot.cn/v1").strip()
+    if not model:
+        model = os.environ.get("MODEL_NAME", "kimi-k2-0711-preview").strip()
+
     timeout = float(os.environ.get("LLM_TIMEOUT_SECONDS", "15"))
 
     if not api_key:
