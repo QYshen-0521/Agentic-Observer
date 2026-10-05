@@ -82,7 +82,13 @@ def main() -> int:
                 planner.note_action(action)
             send_response(sequence, action, state.response_max_bytes if state is not None else 524288)
             if planner is not None:
-                planner.clock.end_decision()
+                planner.clock.end_decision(max(0.0, planner.llm.wait_used - planner._model_wait_start))
+                planner.trace.write({'event': 'decision_metrics', 'sequence': sequence,
+                    'action': action['action'], 'level': planner.state.fast_level,
+                    'cpu_seconds': planner.clock.last_cost, 'wall_seconds': planner.clock.last_wall_cost,
+                    'predicted_science_gain': sum(getattr(p, 'expected_gain', 0.0) for p in planner.state.pending.values()),
+                    'realized_science_gain': getattr(planner.state, 'last_science_gain', 0.0),
+                    **planner._pace_estimate})
 
         elif kind == "finish":
             if planner is not None:

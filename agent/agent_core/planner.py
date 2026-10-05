@@ -86,6 +86,9 @@ class Planner:
         self._fiber_centers = tuple(self.grid.fiber_center(i) for i in range(self.grid.n))
         self._decision_values = None
         self._decision_models = None
+        self._recovery_rounds = 0
+        self._pace_estimate = {}
+        self.adaptive_pacing = True
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -96,6 +99,9 @@ class Planner:
         state = self.state
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
+        self._decision_values = None
+        self._decision_models = None
+        self._model_wait_start = getattr(self.llm, 'wait_used', 0.0)
 
         for message in payload.get("new_messages", []):
             if message.get("record_type") == "forecast":
@@ -118,6 +124,7 @@ class Planner:
             self.total_assigned += int(last_result.get("assigned_count", 0))
             self.total_hit += int(last_result.get("hit_count", 0))
         self.clock.update(payload.get("wallclock"))
+        self.clock.observe_progress(now, state.nights)
         self._pace(now)
         self._current_action_index = payload.get("observe_action_index")
         self._request_thresholds_now = self._request_thresholds(payload.get("active_requests") or [])
@@ -182,6 +189,31 @@ class Planner:
         (see clock.py), so the pace does not depend on how fast the machine is."""
         state = self.state
         night_seconds = sum(max(0.0, (end - max(start, now)).total_seconds()) for start, end in state.nights if end > now)
+        if self.adaptive_pacing:
+            left = self.clock.decisions_left(night_seconds)
+            cpu = 0.85 * self.clock.cpu_left / left
+            wall = max(0.0, self.clock.wall_left - 120.0) / left
+            overhead = self.clock.platform_cost
+            current = state.fast_level
+            # Account for scheduling and simulator overhead separately from CPU.
+            wall_ratio = max(1.0, self.clock.wall_cost / max(0.001, self.clock.avg_cost))
+            fits = lambda level, margin=1.0: (self.clock.level_cost[level] * margin <= cpu
+                and (self.clock.level_cost[level] * wall_ratio + overhead) * margin <= wall)
+            wanted = next((level for level in range(self.min_level, 3) if fits(level)), 2)
+            if wanted < current:
+                self._recovery_rounds = self._recovery_rounds + 1 if fits(wanted, 1.25) else 0
+                level = wanted if self._recovery_rounds >= 8 else current
+            else:
+                self._recovery_rounds = 0
+                level = wanted
+            self.clock.level = level
+            self._pace_estimate = {'decisions_left': round(left, 1), 'cpu_per_turn': cpu,
+                                   'wall_per_turn': wall, 'platform_per_turn': overhead}
+            if level != current:
+                self.log(f'planner: pace level {level} (CPU {cpu*1000:.0f} ms, wall {wall*1000:.0f} ms per turn)')
+                state.fast_level = level
+                self._recovery_rounds = 0
+            return
         decisions_left = max(1.0, night_seconds / 700.0)
         per_decision = self.clock.compute_left() / decisions_left
         level = 0 if per_decision > 0.12 else 1 if per_decision > 0.04 else 2
