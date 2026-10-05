@@ -56,8 +56,12 @@ def parse_platform_message(message: Mapping[str, object]) -> tuple[str, dict]:
     if not isinstance(payload, dict):
         raise ProtocolError("platform message payload must be an object")
     if message_type == "initialize":
-        if payload.get("schema_version") not in ACCEPTED_INITIAL_PUBLICATION_VERSIONS:
-            raise ProtocolError("unsupported initial publication schema_version")
+        schema_ver = payload.get("schema_version", "")
+        if schema_ver not in ACCEPTED_INITIAL_PUBLICATION_VERSIONS:
+            # Log the actual schema_version for debugging
+            import sys
+            print(f"DEBUG: initialize schema_version={schema_ver!r}", file=sys.stderr, flush=True)
+            raise ProtocolError(f"unsupported initial publication schema_version: {schema_ver!r}")
     elif message_type == "decision_request":
         if payload.get("schema_version") not in ACCEPTED_SNAPSHOT_VERSIONS:
             raise ProtocolError("unsupported decision snapshot schema_version")
