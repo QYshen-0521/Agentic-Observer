@@ -10,8 +10,12 @@ INITIAL_PUBLICATION_VERSION = "initial-publication-v2"
 DECISION_SNAPSHOT_VERSION = "decision-snapshot-v3"
 
 # Practice scenarios still speak the pre-anomaly contract; this agent accepts both.
-ACCEPTED_PROTOCOL_VERSIONS = ("participant-agent-protocol-v1", PROTOCOL_VERSION)
-ACCEPTED_SNAPSHOT_VERSIONS = ("decision-snapshot-v2", DECISION_SNAPSHOT_VERSION)
+ACCEPTED_PROTOCOL_VERSIONS = ("participant-agent-protocol-v1", "participant-agent-protocol-v2", "participant-agent-protocol-v3")
+ACCEPTED_SNAPSHOT_VERSIONS = ("decision-snapshot-v2", "decision-snapshot-v3", "decision-snapshot-v4")
+
+# Practice scenarios still speak the pre-anomaly contract; this agent accepts both.
+ACCEPTED_PROTOCOL_VERSIONS = ("participant-agent-protocol-v1", "participant-agent-protocol-v2", "participant-agent-protocol-v3")
+ACCEPTED_SNAPSHOT_VERSIONS = ("decision-snapshot-v2", "decision-snapshot-v3", "decision-snapshot-v4")
 
 
 class ProtocolError(ValueError):
