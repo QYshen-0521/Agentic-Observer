@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+import statistics
 
 # Leave a fifth of the real time for the engine, model waits and safety: on a slow
 # machine (speed_factor 2) the CPU budget alone would fill the whole 30-minute cap.
@@ -35,6 +36,9 @@ class Clock:
         self.level = 0
         self.level_cost = [0.06, 0.02, 0.008]
         self.level_seen = [False] * 3
+        self.search_cost = self.level_cost[:]
+        self.last_search_cost = 0.0
+        self._overheads = deque(maxlen=64)
         self.advances = deque(maxlen=64)
         self._last_now = None
         self._ended_wall = None
@@ -87,8 +91,11 @@ class Clock:
         self.last_cost = time.process_time() - self._started
         self.avg_cost = self.last_cost if self.avg_cost == 0.0 else 0.9 * self.avg_cost + 0.1 * self.last_cost
         level = self.level
-        self.level_cost[level] = (0.85 * self.level_cost[level] + 0.15 * self.last_cost
-                                  if self.level_seen[level] else max(0.001, self.last_cost))
+        self._overheads.append(max(0.0, self.last_cost-self.last_search_cost))
+        overhead = statistics.median(self._overheads)
+        self.search_cost[level] = (0.85*self.search_cost[level]+0.15*self.last_search_cost
+                                  if self.level_seen[level] else max(.001,self.last_search_cost))
+        self.level_cost = [cost+overhead for cost in self.search_cost]
         self.level_seen[level] = True
         self._ended_wall = time.monotonic()
         self.last_wall_cost = self._ended_wall - self._started_wall

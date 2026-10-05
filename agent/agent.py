@@ -86,6 +86,7 @@ def main() -> int:
                 planner.trace.write({'event': 'decision_metrics', 'sequence': sequence,
                     'action': action['action'], 'level': planner.state.fast_level,
                     'cpu_seconds': planner.clock.last_cost, 'wall_seconds': planner.clock.last_wall_cost,
+                    'search_cpu_seconds': planner.clock.last_search_cost,
                     'predicted_science_gain': sum(getattr(p, 'expected_gain', 0.0) for p in planner.state.pending.values()),
                     'realized_science_gain': getattr(planner.state, 'last_science_gain', 0.0),
                     **planner._pace_estimate})

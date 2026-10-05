@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import timedelta
 from collections import OrderedDict
 import math
+import time
 
 from .geometry import (
     Moon,
@@ -86,6 +87,7 @@ class Planner:
         self._request_thresholds_now: dict = {}
         self.required_priority = 1.0
         self.required_bonus = max(0.0, state.scoring.required_penalty) * 1.2
+        self._top_multiplier = max(state.scoring.program_multipliers.values())
         self._fiber_centers = tuple(self.grid.fiber_center(i) for i in range(self.grid.n))
         self._decision_values = None
         self._decision_models = None
@@ -113,6 +115,7 @@ class Planner:
         self._decision_values = None
         self._decision_models = None
         self._model_wait_start = getattr(self.llm, 'wait_used', 0.0)
+        self.clock.last_search_cost = 0.0
 
         for message in payload.get("new_messages", []):
             if message.get("record_type") == "forecast":
@@ -436,7 +439,7 @@ class Planner:
         if self._decision_values is not None and i in self._decision_values:
             return self._decision_values[i]
         state = self.state
-        top = max(state.scoring.program_multipliers.values())
+        top = self._top_multiplier
         gain = max(0.0, state.weight[i] * top - state.best_score[i])
         exempt = (state.required[i] and state.factor[i] < state.scoring.required_threshold) or i in self._request_bonus
         if not exempt:
@@ -462,6 +465,13 @@ class Planner:
     # -- main planning pass -------------------------------------------------------
 
     def plan(self, now, night_end, night_index: int, hours: float):
+        started = time.process_time()
+        try:
+            return self._plan(now, night_end, night_index, hours)
+        finally:
+            self.clock.last_search_cost = time.process_time()-started
+
+    def _plan(self, now, night_end, night_index: int, hours: float):
         state = self.state
         # Snapshot-local caches: feedback, model advice and request progress can
         # all change between calls. Never reuse these across decision requests.
@@ -479,7 +489,10 @@ class Planner:
 
         still_active = []
         candidates: list[tuple[float, int]] = []
-        for i in sorted(set(state.active) | set(self._request_bonus)):
+        # active retains catalogue order; sorting and rebuilding the same set
+        # each exposure is unnecessary unless request targets must be re-added.
+        active = sorted(set(state.active) | set(self._request_bonus)) if self._request_bonus else state.active
+        for i in active:
             v = self._value(i)
             if v <= 0.0:
                 continue
@@ -522,6 +535,9 @@ class Planner:
             f = state.factor[i]
             program = scoring.program_band(model * state.band_scale)
             gain = max(0.0, state.weight[i] * reach * scoring.program_multipliers[program] - state.best_score[i])
+            exempt = (state.required[i] and f < scoring.required_threshold) or i in self._request_bonus
+            if not exempt:
+                gain *= state.science_weight(i, hours)
             gain += self._request_bonus.get(i, 0.0) if reach >= self._request_thresholds_now.get(i, 1.0) else 0.0
             if state.required[i] and f < scoring.required_threshold and reach >= scoring.required_threshold:
                 gain += self.required_bonus * self.required_priority
@@ -636,7 +652,18 @@ class Planner:
                 if k > 0:
                     for threshold in (1.0, scoring.required_threshold if state.required[j] else 1.0,
                                       self._request_thresholds_now.get(j, 1.0)):
-                        durations.add(math.ceil(threshold / k / 30) * 30)
+                        duration = math.ceil(threshold / k / 30) * 30
+                        durations.add(duration)
+                        # Recompute completion boundaries with their own exposure
+                        # average, rather than only the initial quality estimate.
+                        if self._exposure_model is not None:
+                            for _ in range(2):
+                                if not state.min_exposure <= duration <= limit:
+                                    break
+                                average = self._exposure_model.average(j,duration)
+                                rate = state.flux[j]*average*state.scale*PLAN_FACTOR_SAFETY/scoring.f0t0
+                                duration = math.ceil(threshold/max(1e-9,rate)/30)*30
+                                durations.add(duration)
                 durations.add(int(min(limit, up)))
         best = None
         programs = (state.force_program,) if state.force_program else ('DARK', 'BRIGHT', 'BACKUP')

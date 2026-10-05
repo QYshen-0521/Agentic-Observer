@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import sys
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -14,6 +15,7 @@ def main():
     parser.add_argument('--agent-dir', type=Path, default=ROOT/'agent')
     parser.add_argument('--wallclock', type=float, default=900)
     parser.add_argument('--out', type=Path, default=ROOT/'strategy_review_output/v4_rebuild/local-run')
+    parser.add_argument('--env-file', type=Path, help='read model configuration from this private file instead of copying it into an agent snapshot')
     model = parser.add_mutually_exclusive_group()
     model.add_argument('--with-model', dest='with_model', action='store_true',
                        help='enable the model (default); read credentials from agent/.env')
@@ -32,6 +34,12 @@ def main():
     build_env = runner.agent_environment
     def agent_env(*values, **keywords):
         env, names = build_env(*values, **keywords)
+        if args.env_file:
+            extra = runner.load_dotenv(args.env_file)
+            env.update({key:value for key,value in extra.items() if key not in runner.PROTECTED_KEYS})
+            names = sorted(set(names) | set(extra))
+        if os.environ.get('AGENT_TRACE_PATH'):
+            env['AGENT_TRACE_PATH'] = os.environ['AGENT_TRACE_PATH']
         env['OBSERVER_MODEL_DISABLED'] = '0' if args.with_model else '1'
         if args.with_model and not (env.get('OPENAI_API_KEY', '').strip()
                                    or env.get('KIMI_API_KEY', '').strip()):
