@@ -21,14 +21,25 @@ ACCEPTED_SNAPSHOT_VERSIONS = (
     "decision-snapshot-v3",
     "decision-snapshot-v4",
     "decision-snapshot-v5",
+    "v4-decision-snapshot-v1",
+    "v4-decision-snapshot-v2",
+    "v4-decision-snapshot-v3",
+    "v5-decision-snapshot-v1",
+    "v5-decision-snapshot-v2",
 )
 # Accept all known initial publication versions.
+# Platform may use "initial-publication-vN" or "vM-initial-publication-vN" formats.
 ACCEPTED_INITIAL_PUBLICATION_VERSIONS = (
     "initial-publication-v1",
     "initial-publication-v2",
     "initial-publication-v3",
     "initial-publication-v4",
     "initial-publication-v5",
+    "v4-initial-publication-v1",
+    "v4-initial-publication-v2",
+    "v4-initial-publication-v3",
+    "v5-initial-publication-v1",
+    "v5-initial-publication-v2",
 )
 
 
