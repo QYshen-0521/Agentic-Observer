@@ -53,19 +53,38 @@ class ModelSettings:
             load_dotenv = None
         if load_dotenv is not None:
             load_dotenv(dotenv_path=dotenv_path, override=False)
+
+        # Priority 1: Platform-style OPENAI_* variables (used by the evaluation platform)
+        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        openai_model = os.environ.get("OPENAI_MODEL", "").strip()
+        openai_base = os.environ.get("OPENAI_BASE_URL", "").strip()
+
+        # Priority 2: Generic MODEL_* variables (used locally)
         provider = os.environ.get("MODEL_PROVIDER", "deterministic").strip().lower()
         provider = PROVIDER_ALIASES.get(provider, provider)
-        key_name = os.environ.get("MODEL_API_KEY_ENV", "").strip() or PROVIDER_KEY_ENV.get(
-            provider, "MODEL_API_KEY"
-        )
+        model_name = os.environ.get("MODEL_NAME", "").strip()
+        model_base = os.environ.get("MODEL_BASE_URL", "").strip()
+
+        # If OPENAI_* is set, treat as openai provider regardless of MODEL_PROVIDER
+        if openai_key and openai_model:
+            provider = "openai"
+            model_name = openai_model
+            model_base = openai_base
+            api_key = openai_key
+        else:
+            key_name = os.environ.get("MODEL_API_KEY_ENV", "").strip() or PROVIDER_KEY_ENV.get(
+                provider, "MODEL_API_KEY"
+            )
+            api_key = os.environ.get(key_name, "").strip()
+
         api_mode = os.environ.get(
             "MODEL_API_MODE", "responses" if provider == "openai" else "chat"
         ).strip().lower()
         return cls(
             provider=provider,
-            model=os.environ.get("MODEL_NAME", "").strip(),
-            base_url=os.environ.get("MODEL_BASE_URL", "").strip(),
-            api_key=os.environ.get(key_name, "").strip(),
+            model=model_name,
+            base_url=model_base,
+            api_key=api_key,
             api_mode=api_mode,
             timeout_seconds=float(os.environ.get("LLM_TIMEOUT_SECONDS", "30")),
             max_retries=int(os.environ.get("LLM_MAX_RETRIES", "1")),
