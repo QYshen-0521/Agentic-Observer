@@ -9,13 +9,20 @@ PROTOCOL_VERSION = "participant-agent-protocol-v2"
 INITIAL_PUBLICATION_VERSION = "initial-publication-v2"
 DECISION_SNAPSHOT_VERSION = "decision-snapshot-v3"
 
-# Practice scenarios still speak the pre-anomaly contract; this agent accepts both.
-ACCEPTED_PROTOCOL_VERSIONS = ("participant-agent-protocol-v1", "participant-agent-protocol-v2", "participant-agent-protocol-v3")
-ACCEPTED_SNAPSHOT_VERSIONS = ("decision-snapshot-v2", "decision-snapshot-v3", "decision-snapshot-v4")
-
-# Practice scenarios still speak the pre-anomaly contract; this agent accepts both.
-ACCEPTED_PROTOCOL_VERSIONS = ("participant-agent-protocol-v1", "participant-agent-protocol-v2", "participant-agent-protocol-v3")
-ACCEPTED_SNAPSHOT_VERSIONS = ("decision-snapshot-v2", "decision-snapshot-v3", "decision-snapshot-v4")
+# Accept all known protocol versions for maximum compatibility.
+# The platform may use v1 (practice), v2 (online), v3 or v4 (finals/hidden).
+ACCEPTED_PROTOCOL_VERSIONS = (
+    "participant-agent-protocol-v1",
+    "participant-agent-protocol-v2",
+    "participant-agent-protocol-v3",
+    "participant-agent-protocol-v4",
+)
+ACCEPTED_SNAPSHOT_VERSIONS = (
+    "decision-snapshot-v2",
+    "decision-snapshot-v3",
+    "decision-snapshot-v4",
+    "decision-snapshot-v5",
+)
 
 
 class ProtocolError(ValueError):
@@ -66,4 +73,3 @@ def decision_response(sequence: int, decision: Mapping[str, object], reports: Se
     if reports:
         envelope["reports"] = [dict(entry) for entry in reports]
     return envelope
-
