@@ -32,6 +32,7 @@ from .state import PendingPrediction
 from .advice import make_night_plan
 from .calibration import PointingCalibration
 from .exposure import ExposureModel
+from .fields import phase_fields
 from .requests import RequestScheduler
 
 PLAN_FACTOR_SAFETY = 0.9
@@ -555,53 +556,53 @@ class Planner:
                 anchors.append((weighted, i))
         if not anchors:
             return None
-        anchors.sort(key=lambda t: -t[0])
+        # Use neighbourhood throughput rather than isolated target value.
+        # A small shortlist keeps this bounded on 50k-target cards.
+        pool = anchors
+        bins = {}
+        width = max(0.4, self.grid.fov * 0.5)
+        cos_lat = max(0.2, math.cos(math.radians(sum(state.dec[i] for _, i in pool) / len(pool))))
+        for value, i in pool:
+            key = (int(state.ra[i] * cos_lat / width), int(state.dec[i] / width))
+            bins.setdefault(key, []).append((value, i))
+        dense = []
+        for entries in bins.values():
+            entries.sort(reverse=True)
+            _, i = entries[0]
+            alt, _ = altaz(i)
+            model = self._target_model(i, alt, moon)
+            k = state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
+            threshold = (scoring.required_threshold
+                         if state.required[i] and state.factor[i] < scoring.required_threshold else 1.0)
+            seconds = max(state.min_exposure, min(state.max_exposure, threshold / max(1e-9, k)))
+            dense.append((sum(v for v, _ in entries[:self.grid.n]) / seconds, i))
+        anchors = sorted(dense, reverse=True)
+        # Separate anchor regions so the bounded search explores distinct fields.
+        diverse = []
+        for value, i in anchors:
+            if all(abs(wrap180(state.ra[i] - state.ra[j])) * cos_lat > width * 0.6
+                   or abs(state.dec[i] - state.dec[j]) > width * 0.6 for _, j in diverse):
+                diverse.append((value, i))
+            if len(diverse) >= 14:
+                break
+        anchors = diverse or anchors
 
-        n_anchors = 1 if state.fast_level >= 1 else ANCHORS
-        middle = sorted({(self.grid.side - 1) // 2, self.grid.side // 2})
-        fibers = range(self.grid.n) if state.fast_level < 2 else tuple(
-            row * self.grid.side + col for row in middle for col in middle)
-        fields = []
-        tried = 0
-        for _, anchor in anchors:
-            if tried >= n_anchors and fields:
-                break
-            if tried >= n_anchors + 8:
-                break
-            tried += 1
-            a_alt, a_az = altaz(anchor)
-            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], 1.42 * self.grid.fov) if j in visible]
-            near_values = {j: achievable(j) for j in near}
-            for fiber in fibers:
-                d_north, d_east = self._fiber_centers[fiber]
-                c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
-                if not (state.min_alt + 1.5 <= c_alt <= 89.0):
-                    continue
-                c_alt = round(c_alt, 4)
-                c_az = round(c_az, 4) % 360.0
-                chosen = {}
-                for j, v in near_values.items():
-                    if v <= 0.0:
-                        continue
-                    alt, az = altaz(j)
-                    offsets = tangent_offsets(alt, az, c_alt, c_az)
-                    if offsets is None:
-                        continue
-                    fib, margin = self.grid.classify(*offsets)
-                    if fib is None:
-                        continue
-                    score = v * (1.0 if margin >= EDGE_MARGIN_DEG else 0.65)
-                    chosen.setdefault(fib, []).append((score, j, margin))
-                if not chosen:
-                    continue
-                for options in chosen.values():
-                    options.sort(reverse=True)
-                    del options[3:]
-                total = sum(options[0][0] for options in chosen.values())
-                fields.append((total, c_alt, c_az, chosen))
+        def completion_seconds(i):
+            alt, _ = altaz(i)
+            model = self._target_model(i, alt, moon)
+            k = state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
+            threshold = (scoring.required_threshold
+                         if state.required[i] and state.factor[i] < scoring.required_threshold else 1.0)
+            return max(state.min_exposure, min(state.max_exposure, threshold / max(1e-9, k)))
+
+        fields = phase_fields(
+            self.grid, self._fiber_centers, anchors,
+            lambda i, radius: state.neighbours(state.ra[i], state.dec[i], radius),
+            visible, altaz, achievable, completion_seconds, state.fast_level, EDGE_MARGIN_DEG)
+        fields = [field for field in fields if field[1] >= state.min_alt + 1.5]
         if not fields:
             return None
-        fields.sort(key=lambda field: -field[0])
+        fields.sort(key=lambda field: -self._coarse_field_rate(field[3], now, lst, seconds_left, moon, altaz))
         # Jointly compare a bounded shortlist; do not choose a field before costing
         # the common duration and program of its actual assignments.
         plans = []
@@ -624,6 +625,48 @@ class Planner:
         rate = sum(p.expected_gain for p in predictions.values()) / action['duration_seconds']
         self._science_rate = 0.9*self._science_rate + 0.1*rate
         return action
+
+    def _coarse_field_rate(self, chosen, now, lst, seconds_left, moon, altaz):
+        """Cheap duration-aware ranking before the full integrated exposure search."""
+        state, scoring = self.state, self.state.scoring
+        limit = min(seconds_left, state.max_exposure)
+        options, durations = [], {state.min_exposure, int(limit), 300, 600, 900, 1800}
+        for choices in chosen.values():
+            group = []
+            for _, i, margin in choices:
+                alt, az = altaz(i)
+                model = self._target_model(i, alt, moon)
+                k = state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY / scoring.f0t0
+                up = ((state.hmax[i] - wrap180(lst - state.ra[i])) / SIDEREAL_DEG_PER_SECOND
+                      if state.hmax[i] < 180 else 1e9)
+                mult = scoring.program_multipliers[scoring.program_band(model * state.band_scale)]
+                group.append((i, k, up, mult, margin))
+                if k > 0 and state.required[i] and state.factor[i] < scoring.required_threshold:
+                    durations.add(math.ceil(scoring.required_threshold / k / 30) * 30)
+            options.append(group)
+        best = 0.0
+        for duration in durations:
+            if not state.min_exposure <= duration <= limit:
+                continue
+            gain = 0.0
+            for group in options:
+                value = 0.0
+                for i, k, up, mult, margin in group:
+                    if up < duration:
+                        continue
+                    factor = min(1.0, k * duration)
+                    science = max(0.0, state.weight[i] * factor * mult - state.best_score[i])
+                    exempt = (state.required[i] and state.factor[i] < scoring.required_threshold) or i in self._request_bonus
+                    if not exempt:
+                        science *= state.science_weight(i, self._hours)
+                    if state.required[i] and state.factor[i] < scoring.required_threshold <= factor:
+                        science += self.required_bonus * self.required_priority
+                    if factor >= self._request_thresholds_now.get(i, 1.0):
+                        science += self._request_bonus.get(i, 0.0)
+                    value = max(value, science * (1.0 if margin >= EDGE_MARGIN_DEG else 0.65))
+                gain += value
+            best = max(best, gain / duration)
+        return best
 
     def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index):
         state, scoring = self.state, self.state.scoring
@@ -681,7 +724,11 @@ class Planner:
                         model, k, band = exposure_values[j]
                         reached = min(1.0, k * duration)
                         score = state.weight[j] * reached * scoring.program_multiplier(program, band)
-                        value = max(0.0, score - state.best_score[j])
+                        # Completion-weighted planning surrogate: scores retain
+                        # their real linear marginal value in pending feedback.
+                        # Discourage many short exposures that cannot accumulate.
+                        cap = max(1e-9, state.weight[j] * self._top_multiplier)
+                        value = max(0.0, cap * ((score / cap) ** 1.6 - (state.best_score[j] / cap) ** 1.6))
                         exempt = (state.required[j] and state.factor[j] < scoring.required_threshold) or j in self._request_bonus
                         if not exempt:
                             value *= state.science_weight(j, hours)

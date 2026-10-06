@@ -11,6 +11,17 @@ class ExposureModel:
         self.moons, self.samples, self.exposures = {}, {}, {}
 
     def sample(self, i, offset):
+        # Smooth public geometry is shared across the many duration candidates.
+        # Interpolate between five-minute nodes, retaining slot-midpoint weights.
+        lower = int(offset // 300) * 300
+        upper = lower + 300
+        a = self.exact_sample(i, lower)
+        if offset == lower:
+            return a
+        b = self.exact_sample(i, upper)
+        return a + (b - a) * (offset - lower) / 300
+
+    def exact_sample(self, i, offset):
         key = (i, offset)
         if key not in self.samples:
             state = self.state

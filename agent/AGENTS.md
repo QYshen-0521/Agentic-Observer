@@ -23,6 +23,7 @@ agent_core/
   geometry.py              public sky maths (sidereal time, alt/az, fibre grid)
   calibration.py           fixed pointing offset inferred from public hit feedback
   exposure.py              snapshot-local public-slot midpoint integration
+  fields.py                bounded grid phase screening and exact field reprojection
   requests.py              bounded future-window request beam search
   advice.py                connected notice parsing -> bounded nightly model plan
   scoring.py               factor/score estimates from PUBLIC scoring config only
