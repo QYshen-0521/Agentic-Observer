@@ -2,6 +2,7 @@
 from collections import deque
 
 from .geometry import tangent_offsets
+from .features import enabled
 
 
 class PointingCalibration:
@@ -11,6 +12,7 @@ class PointingCalibration:
         self.samples = deque(maxlen=160)
         self.pending = []
         self.exposures = 0
+        self.expand_search = enabled('calibration')
 
     def command(self, alt, az):
         return alt - self.offset[0], (az - self.offset[1]) % 360.0
@@ -46,12 +48,30 @@ class PointingCalibration:
         candidates = [(a * step, z * step) for a in range(-9, 10) for z in range(-9, 10)]
         scored = [(self._errors(offset), offset) for offset in candidates]
         _, center = min(scored, key=lambda pair: (pair[0], sum(x*x for x in pair[1])))
+        if self.expand_search:
+            # Keep the grid count bounded while expanding its physical extent.
+            # A confidence check below still requires explaining independent hits.
+            for _ in range(3):
+                if max(abs(v) for v in center) < 8.5*step and self._errors(center) <= len(self.samples)*.15:
+                    break
+                step *= 2
+                candidates = [(a*step,z*step) for a in range(-9,10) for z in range(-9,10)]
+                scored = [(self._errors(offset),offset) for offset in candidates]
+                _,center = min(scored,key=lambda pair:(pair[0],sum(x*x for x in pair[1])))
         fine = [(center[0] + a*step/4, center[1] + z*step/4)
                 for a in range(-4, 5) for z in range(-4, 5)]
         scored = [(self._errors(offset), offset) for offset in fine]
         minimum = min(error for error, _ in scored)
         winners = [offset for error, offset in scored if error == minimum]
         estimate = tuple(sum(o[k] for o in winners)/len(winners) for k in (0, 1))
+        if self.expand_search:
+            fine_step = step / 16
+            for _ in range(2):
+                points = [(estimate[0]+a*fine_step,estimate[1]+z*fine_step)
+                          for a in range(-4,5) for z in range(-4,5)]
+                scored = [(self._errors(point),point) for point in points]
+                _,estimate = min(scored,key=lambda pair:(pair[0],sum((v-o)**2 for v,o in zip(pair[1],estimate))))
+                fine_step /= 4
         error = self._errors(estimate)
         if error <= max(1, len(self.samples)*0.025) and old_error-error >= 3:
             self.offset = estimate

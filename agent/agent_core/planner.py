@@ -10,6 +10,8 @@ from datetime import timedelta
 from collections import OrderedDict
 import math
 import time
+import json
+from .features import enabled, fixed_level, FEATURES
 
 from .geometry import (
     Moon,
@@ -79,6 +81,10 @@ class Planner:
         self._last_advice_key = None
         self._last_advice_night = -100
         self.last_report_hours = float("-inf")
+        self.last_veto_hours = float('-inf')
+        self.last_diagnostic_hours = float('-inf')
+        self.diagnostic_remaining = 0
+        self.earthquake_until = float('-inf')
         self.suspicion_hours: list[float] = []
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
@@ -95,16 +101,22 @@ class Planner:
         self._decision_models = None
         self._recovery_rounds = 0
         self._pace_estimate = {}
-        self.adaptive_pacing = True
-        self.integrated_quality = True
+        self.adaptive_pacing = enabled('pacing')
+        self.fixed_level = fixed_level()
+        self.integrated_quality = enabled('integration')
         self._exposure_model = None
         self._hours = 0.0
         self.request_scheduler = RequestScheduler(state, self._direction_factor)
-        self.scheduled_requests = True
+        self.scheduled_requests = enabled('requests')
+        self.robust_faults = enabled('fault')
+        self.state.suppress_stagnation = enabled('stagnation')
         self._science_rate = 0.005
         self._advice_cache = OrderedDict()
-        self._pro = ProPlanner(self._core_public_input(state),log)
+        self._pro = ProPlanner(self._core_public_input(state),log,
+                               (state.first_night,state.last_night,state.required_nights))
         self._pro._offset_evidence = lambda hits: None
+        self._diagnostic_turn = 0
+        log('planner-features: ' + json.dumps({name:enabled(name) for name in sorted(FEATURES)},sort_keys=True))
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -118,7 +130,7 @@ class Planner:
         self._hours = hours
         self._pro.on_result(payload.get("last_result"),now,hours)
         self._pro.on_messages(payload.get("new_messages") or [],payload.get("latest_bulletin"))
-        self._pro.on_requests(payload.get("active_requests") or [])
+        self._pro.on_requests((payload.get("active_requests") or []) if self.scheduled_requests else [])
         self._decision_values = None
         self._decision_models = None
         self._model_wait_start = getattr(self.llm, 'wait_used', 0.0)
@@ -141,8 +153,21 @@ class Planner:
             state.progress_epoch += 1
         # Consume the previous valid exposure before applying a later invalidation.
         state.on_result(payload.get("last_result"), hours)
+        if self._pro.shared_quality:
+            state.scale,state.prior_scale = self._pro.scale,self._pro.prior_scale
+            state.band_scale = self._pro.calibrated_band_scale(hours)
+            if state.clean_history and state.clean_history[-1][0] == hours:
+                ratio = getattr(self._pro,'latest_clean_ratio',None)
+                previous = state.clean_history.pop()
+                if ratio is not None:
+                    state.clean_history.append((hours,previous[1],ratio))
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
         self._on_report_result(payload.get("last_result"))
+        if self.robust_faults:
+            quake = any(notice.startswith('earthquake|') for notice in state.notices)
+            if quake and not getattr(self,'_quake_active',False):
+                self.earthquake_until = hours + 12.0
+            self._quake_active = quake
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
@@ -201,6 +226,15 @@ class Planner:
         if action.get("action") != "report":
             self.report_pending = False  # validation may have replaced a proposed report
         self.calibration.record(action, self.state.pending, self.state.min_alt)
+        self._diagnostic_turn += 1
+        if self._diagnostic_turn % 128 == 0:
+            metrics = {'turn':self._diagnostic_turn,'observes':self.observe_count,'reports':self.reports,
+                'repairs':self.repairs,'false_since_repair':self.false_reports,'assigned':self.total_assigned,
+                'hit':self.total_hit,'level':self.state.fast_level,'cpu_left':self.clock.cpu_left,
+                'wall_left':self.clock.wall_left,'scale':self.state.scale,'band_scale':self.state.band_scale,
+                'model_calls':getattr(self.llm,'calls_made',0), 'search':self._pro.metrics}
+            self.log('planner-metrics: '+json.dumps(metrics,sort_keys=True))
+            self.trace.write({'event':'planner_metrics',**metrics})
 
     def _to_next_slot(self, now, night_start) -> int:
         slot = self.state.slot_seconds
@@ -212,6 +246,9 @@ class Planner:
         still to come. Budget and own cost are both real CPU seconds of this machine
         (see clock.py), so the pace does not depend on how fast the machine is."""
         state = self.state
+        if self.fixed_level is not None:
+            state.fast_level = self.clock.level = self.fixed_level
+            return
         night_seconds = sum(max(0.0, (end - max(start, now)).total_seconds()) for start, end in state.nights if end > now)
         if self.adaptive_pacing:
             left = self.clock.decisions_left(night_seconds)
@@ -233,6 +270,11 @@ class Planner:
             self.clock.level = level
             self._pace_estimate = {'decisions_left': round(left, 1), 'cpu_per_turn': cpu,
                                    'wall_per_turn': wall, 'platform_per_turn': overhead}
+            # Under wall pressure, reducing compute alone cannot remove simulator
+            # round trips. Prefer useful longer exposures; imminent windows are exempt.
+            cost = self.clock.level_cost[level]*wall_ratio+overhead
+            self._pro.min_progress_seconds = min(state.max_exposure,
+                night_seconds*cost/max(1.0,self.clock.wall_left-120.0)) if cost>wall else 0.0
             if level != current:
                 self.log(f'planner: pace level {level} (CPU {cpu*1000:.0f} ms, wall {wall*1000:.0f} ms per turn)')
                 state.fast_level = level
@@ -322,6 +364,11 @@ class Planner:
     def _maybe_report(self, hours: float, payload: dict):
         state = self.state
         state.force_program = None
+        # Evidence already excludes exposures with all-sky weather. A new
+        # cloudy bulletin must not veto a sustained, earlier CLEAN collapse.
+        if self.robust_faults and (hours < self.earthquake_until
+                                  or hours-self.last_veto_hours < 6.0):
+            return None
         paid = self.false_reports >= state.false_report_free_allowance
         cooldown = 72.0 if paid else 24.0
         if self.report_pending or hours - self.last_report_hours < cooldown:
@@ -334,7 +381,12 @@ class Planner:
         # Program band excludes instrument efficiency. Matched DARK observations
         # during a sustained science-quality collapse corroborate an instrument fault.
         if evidence.dark_matched < 6:
-            state.force_program = "DARK"
+            if self.robust_faults and hours-self.last_diagnostic_hours >= 12.0:
+                self.diagnostic_remaining = 6
+                self.last_diagnostic_hours = hours
+            if not self.robust_faults or self.diagnostic_remaining > 0:
+                state.force_program = "DARK"
+                self.diagnostic_remaining = max(0,self.diagnostic_remaining-1)
             if paid:
                 return None
         if paid and evidence.recent_nights < 2:
@@ -354,9 +406,13 @@ class Planner:
              "free_allowance": state.false_report_free_allowance}, self.clock.wall_left,
         )
         verdict = verdict_answer.get("report") if isinstance(verdict_answer, dict) else None
-        self.last_report_hours = hours
         if verdict is False:
+            if self.robust_faults:
+                self.last_veto_hours = hours
+            else:
+                self.last_report_hours = hours
             return None
+        self.last_report_hours = hours
         self.reports += 1
         self.report_pending = True
         self.log(f"planner: reporting instrument fault at {payload.get('now_utc')} evidence={evidence}")
@@ -496,6 +552,16 @@ class Planner:
         p.factor = state.factor[:]
         p.cur = [score/max(w,1e-9) for score,w in zip(state.best_score,state.weight)]
         p.misses = state.misses[:]
+        p.blocked = list(state.blocked)
+        if p.shared_quality:
+            p.update_scale(hours)
+            state.scale,state.prior_scale,state.band_scale = p.scale,p.prior_scale,p.calibrated_band_scale(hours)
+            p.attempts = state.attempts[:]
+        p.exposure_model = ExposureModel(state,now,local_sidereal_deg(now,state.lon),state.nights[night_index][0]) if self.integrated_quality else None
+        p.science_weights = {i:state.science_weight(i,hours) for i in state.cooldown_until
+                             if not state.required[i] and i not in p.request_terms}
+        if self.scheduled_requests:
+            p.filter_requests(now)
         if p.required_priority!=self.required_priority:
             p.vdirty.update(i for i,required in enumerate(state.required) if required)
         p.extra_avoid = set(state.extra_avoid)
@@ -519,6 +585,8 @@ class Planner:
             factor = min(1.0,prediction['pred'])
             band = p._band(prediction['model']*band_scale)
             score = state.weight[i]*factor*state.scoring.program_multiplier(action['program'],band)
+            if self.robust_faults and (hours<self.earthquake_until or getattr(self,'_quake_active',False)):
+                prediction['clean'] = False
             predictions[target_id] = PendingPrediction(prediction['model'],prediction['band_model'],prediction['alt'],prediction['az'],prediction['clean'],max(0,score-state.best_score[i]))
         state.pending = predictions
         state.pending_action_index = self._current_action_index

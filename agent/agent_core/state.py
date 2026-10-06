@@ -16,6 +16,7 @@ from typing import NamedTuple, Optional
 
 from .geometry import FiberGrid, max_hour_angle_deg, parse_utc, wrap180
 from .scoring import ScoringModel
+from .features import enabled
 
 ALT_MARGIN_DEG = 0.6
 SKY_MEMORY_HOURS = 2.0
@@ -60,6 +61,7 @@ def _mod(a: float, n: float) -> float:
 class SurveyState:
     def __init__(self, init_payload: dict):
         self.public_init = init_payload
+        self.shared_quality = enabled('quality')
         site = init_payload["site"]
         survey = init_payload["survey"]
         instrument = init_payload["instrument"]
@@ -199,6 +201,7 @@ class SurveyState:
         n = len(self.ra)
         first_night = [len(self.nights)] * n
         last_night = [-1] * n
+        self.required_nights = {}
         for i in self.active:
             h = self.hmax[i]
             for k, (l0, span) in enumerate(spans):
@@ -211,6 +214,8 @@ class SurveyState:
                     if first_night[i] > k:
                         first_night[i] = k
                     last_night[i] = k
+                if self.required[i] and overlap >= self.min_exposure * SIDEREAL_DEG_PER_SECOND:
+                    self.required_nights.setdefault(i, []).append(k)
         return first_night, last_night
 
     # -- messages and results -------------------------------------------------
@@ -351,6 +356,13 @@ class SurveyState:
                 self.attempts[i] += 1
             if factor < 0.97 and self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0:
                 ratio = (factor * f0t0) / (self.flux[i] * self.pending_duration * prediction.model)
+                if self.shared_quality:
+                    # Project the prior onto the physically possible interval. A
+                    # score equal to the mismatch multiplier is NOT proof of saturation.
+                    if upper >= .97:
+                        continue
+                    ratio_high = upper*f0t0/(self.flux[i]*self.pending_duration*prediction.model)
+                    ratio = min(ratio_high,max(ratio,self.scale))
                 exposure_ratios.append(ratio)
                 if prediction.clean:
                     clean_ratios.append(ratio)
@@ -397,7 +409,12 @@ class SurveyState:
         lo = statistics.median(lower) if lower else 0.05
         hi = statistics.median(upper) if upper else 2.0
         if lo <= hi:
-            self.band_scale = min(hi, max(lo, self.band_scale))
+            centre = self.band_scale
+            if self.shared_quality and not lower and not upper and self.all_sky_notice():
+                # Announced all-sky weather changes the band; an unexplained
+                # efficiency collapse must not drag it down with the instrument.
+                centre = self.scale / .95
+            self.band_scale = min(hi, max(lo, centre))
 
     # -- fault diagnostics ------------------------------------------------------
 

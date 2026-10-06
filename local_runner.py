@@ -40,6 +40,9 @@ def main():
             names = sorted(set(names) | set(extra))
         if os.environ.get('AGENT_TRACE_PATH'):
             env['AGENT_TRACE_PATH'] = os.environ['AGENT_TRACE_PATH']
+        for key in ('OBSERVER_DISABLE_FEATURES','OBSERVER_FIXED_LEVEL'):
+            if key in os.environ:
+                env[key] = os.environ[key]
         env['OBSERVER_MODEL_DISABLED'] = '0' if args.with_model else '1'
         if args.with_model and not (env.get('OPENAI_API_KEY', '').strip()
                                    or env.get('KIMI_API_KEY', '').strip()):

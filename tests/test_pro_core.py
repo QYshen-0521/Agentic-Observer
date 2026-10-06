@@ -29,7 +29,7 @@ class ProCoreTests(unittest.TestCase):
 
     def test_every_live_search_level_uses_dynamic_3_4_10_grid(self):
         now=parse_utc(request()['now_utc'])
-        for side in (3,4,10):
+        for side in (3,4,5,10):
             for level in (0,1,2):
                 with self.subTest(side=side,level=level):
                     s=SurveyState(initial(side));p=Planner(s);s.fast_level=level

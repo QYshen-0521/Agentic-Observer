@@ -31,6 +31,7 @@ import math
 import os
 from collections import deque
 from datetime import datetime, timedelta
+from .features import enabled
 
 from .pro_skymath import (
     SIDEREAL_DEG_PER_SECOND,
@@ -122,8 +123,17 @@ def _az_distance(a: float, b: float) -> float:
 
 
 class Planner:
-    def __init__(self, init: dict, log=lambda text: None):
+    def __init__(self, init: dict, log=lambda text: None, public_windows=None):
         self.log = log
+        self.joint_program = enabled('joint')
+        self.protect_required = enabled('required')
+        self.diverse_search = enabled('diversity')
+        self.group_requests = enabled('requests')
+        self.shared_quality = enabled('quality')
+        self.exposure_model = None
+        self.science_weights = {}
+        self.metrics = {}
+        self.min_progress_seconds = 0.0
         site = init["site"]
         self.lat = float(site["latitude_deg"])
         self.lon = float(site["longitude_deg"])
@@ -176,7 +186,10 @@ class Planner:
         self.alt_c = [self.cos_lat * c * math.sin(math.radians(r)) for c, r in zip(self.cos_dec, self.ra)]
         self.sin_alt_limit = math.sin(math.radians(self.min_alt + ALT_MARGIN_DEG))
         self._build_index()
-        self._build_windows()
+        if public_windows is None:
+            self._build_windows()
+        else:
+            self.first_night, self.last_night, self.required_nights = public_windows
         # best sky model a target can ever get: at transit, Moon down (used to time faint required targets)
         self.ideal_model = [1.0 / (self.q0 * normalized_airmass(max(1.0, 90.0 - abs(d - self.lat))) ** self.airmass_exponent)
                             for d in self.dec]
@@ -221,6 +234,7 @@ class Planner:
         self.request_bonus: dict[int, float] = {}
         self.request_threshold: dict[int, float] = {}
         self.request_terms = {}
+        self.request_groups = []
         # season plan: targets worth completing (value density w*flux above a cut that fills the capacity)
         self.density_order = sorted(range(len(rows)), key=lambda i: -self.weight[i] * self.flux[i])
         self.planned = [False] * len(rows)
@@ -240,6 +254,9 @@ class Planner:
         """Per night, the best public sky model (airmass + Moon, no weather) a required target can get.
         Uses only geometry and the lunar ephemeris: when the target is highest during that night's window."""
         self.night_best = {}
+        self.calendar_moons = {}
+        self.calendar_lsts = [(start, local_sidereal_deg(start,self.lon),(end-start).total_seconds())
+                              for start,end in self.nights]
         if not REQ_CALENDAR:
             return
         lsts = [(start, local_sidereal_deg(start, self.lon), (end - start).total_seconds()) for start, end in self.nights]
@@ -268,6 +285,22 @@ class Planner:
 
     def best_future_model(self, i: int, night_index: int) -> float:
         row = self.night_best.get(i)
+        if row is None and self.protect_required:
+            # Lazy per-target calendar: no catalogue-wide lunar computation at
+            # startup, and no private weather assumptions for later nights.
+            row = [0.0]*len(self.nights)
+            for k in self.required_nights.get(i,[]):
+                start,lst,span = self.calendar_lsts[k]
+                ha = wrap180(lst-self.ra[i])
+                t = min(max(-ha/SIDEREAL_DEG_PER_SECOND,0.0),span)
+                key = (k,int(t//1800))
+                if key not in self.calendar_moons:
+                    moment = start+timedelta(seconds=min(span,(key[1]+.5)*1800))
+                    self.calendar_moons[key] = Moon(moment,local_sidereal_deg(moment,self.lon),self.lat,self.lunar_model)
+                alt,_ = radec_to_altaz(self.ra[i],self.dec[i],lst+t*SIDEREAL_DEG_PER_SECOND,self.lat)
+                if alt>=self.min_alt:
+                    row[k] = self.calendar_moons[key].lunar_factor(self.ra[i],self.dec[i])/(self.q0*normalized_airmass(alt)**self.airmass_exponent)
+            self.night_best[i] = row
         if not row or night_index + 1 >= len(row):
             return 0.0
         return max(row[night_index + 1:])
@@ -298,6 +331,7 @@ class Planner:
                  for start, end in self.nights]
         self.first_night = [len(self.nights)] * len(self.ra)
         self.last_night = [-1] * len(self.ra)
+        self.required_nights = {}
         for i in self.active:
             h = self.hmax[i]
             for k, (l0, span) in enumerate(spans):
@@ -310,6 +344,23 @@ class Planner:
                     if self.first_night[i] > k:
                         self.first_night[i] = k
                     self.last_night[i] = k
+                if self.required[i] and overlap >= self.min_exposure * SIDEREAL_DEG_PER_SECOND:
+                    self.required_nights.setdefault(i, []).append(k)
+
+    def remaining_opportunities(self, i, night_index):
+        nights = self.required_nights.get(i, [])
+        return len(nights) - bisect.bisect_left(nights, night_index)
+
+    def required_urgency(self, i, night_index):
+        if not self.protect_required or not self.required[i] or self.factor[i] >= self.required_threshold:
+            return 1.0
+        return 1.0 + 2.0 / max(1, self.remaining_opportunities(i, night_index))
+
+    def threshold_duration(self, i, model, scale, threshold):
+        rate = self.flux[i] * model * scale / self.f0t0
+        if rate <= 0:
+            return self.max_exposure + 1
+        return max(self.min_exposure, math.ceil(threshold * 1.08 / rate))
 
     # --- messages and results --------------------------------------------------------------------
 
@@ -332,6 +383,7 @@ class Planner:
         self.request_bonus = {}
         self.request_threshold = {}
         self.request_terms = {}
+        self.request_groups = []
         for request in requests:
             # A request that already met its minimum still appears until its deadline
             # with remaining_count 0; its reward is settled, so it adds no value.
@@ -343,6 +395,13 @@ class Planner:
             threshold = float(request["completion_factor_threshold"])
             deadline = parse_utc(request["deadline_utc"]) if request.get("deadline_utc") else None
             issued = parse_utc(request["issued_at_utc"]) if request.get("issued_at_utc") else None
+            indices = {self.index_of[t] for t in request['target_ids']
+                       if t in self.index_of and t not in completed}
+            if float(request['completion_reward']) <= 0 or len(indices) < remaining:
+                continue
+            self.request_groups.append({'id': request.get('request_id'), 'targets': indices,
+                'remaining': remaining, 'threshold': threshold, 'reward': float(request['completion_reward']),
+                'issued': issued, 'deadline': deadline})
             for target_id in request["target_ids"]:
                 if target_id in completed or target_id not in self.index_of:
                     continue
@@ -356,6 +415,69 @@ class Planner:
                     self.active.append(i)
         if old != self.request_bonus:
             self.vdirty.update(old)
+            self.vdirty.update(self.request_bonus)
+
+    def request_value(self, factors, now, duration):
+        """Planning credit is capped once per request; never a realized ledger update."""
+        end = now + timedelta(seconds=duration)
+        total = 0.0
+        for group in self.request_groups:
+            if group['deadline'] is None or end > group['deadline'] or (group['issued'] and now < group['issued']):
+                continue
+            probabilities = sorted((min(1.0, max(0.0,
+                (factors[i] / max(1e-9, group['threshold']) - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
+                for i in group['targets'] if i in factors), reverse=True)
+            total += REQUEST_MULT * group['reward'] * sum(probabilities[:group['remaining']]) / group['remaining']
+        return total
+
+    def filter_requests(self, now):
+        """Reject provably impossible windows using optimistic PUBLIC geometry only."""
+        feasible = []
+        old_bonus = self.request_bonus.copy()
+        for group in self.request_groups:
+            deadline = group['deadline']
+            if deadline is None or deadline <= now:
+                continue
+            start = max(now, group['issued'] or now)
+            possible = 0
+            for i in group['targets']:
+                duration = self.threshold_duration(i, self.ideal_model[i], max(1.0, self.scale), group['threshold']) / 1.08
+                if duration > self.max_exposure:
+                    continue
+                for night_start, night_end in self.nights:
+                    a, b = max(start, night_start), min(deadline, night_end)
+                    if (b-a).total_seconds() < max(self.min_exposure, duration):
+                        continue
+                    span = (b-a).total_seconds() * SIDEREAL_DEG_PER_SECOND
+                    h = self.hmax[i]
+                    left = (self.ra[i]-h-local_sidereal_deg(a,self.lon)) % 360.0
+                    overlap = span if h >= 180 else max(0.0,min(span,left+2*h)-left) + max(0.0,min(span,left-360+2*h))
+                    if overlap / SIDEREAL_DEG_PER_SECOND >= max(self.min_exposure,duration):
+                        possible += 1
+                        break
+            if possible >= group['remaining']:
+                feasible.append(group)
+        allowed = {i for g in feasible for i in g['targets']}
+        removed = set(self.request_terms)-allowed
+        for i in removed:
+            self.request_terms.pop(i,None)
+            self.request_bonus.pop(i,None)
+            self.request_threshold.pop(i,None)
+        self.vdirty.update(removed)
+        self.request_groups = feasible
+        # Drop terms of rejected overlapping groups too, even if another group
+        # still mentions the same target.
+        self.request_terms = {}
+        self.request_bonus = {}
+        self.request_threshold = {}
+        for group in feasible:
+            unit = REQUEST_MULT*group['reward']/group['remaining']
+            for i in group['targets']:
+                self.request_terms.setdefault(i,[]).append((group['threshold'],unit,group['issued'],group['deadline']))
+                self.request_bonus[i] = self.request_bonus.get(i,0.0)+unit
+                self.request_threshold[i] = max(self.request_threshold.get(i,0.0),group['threshold'])
+        if old_bonus != self.request_bonus:
+            self.vdirty.update(old_bonus)
             self.vdirty.update(self.request_bonus)
 
     def _resync(self, message: dict) -> None:
@@ -382,6 +504,8 @@ class Planner:
 
     def on_result(self, result, now: datetime, hours: float) -> None:
         """Update factor estimates and the sky-quality estimate from the previous observe."""
+        exposure_samples,clean_samples,band_samples = [],[],[]
+        self.latest_clean_ratio = None
         if not result or result.get("action") != "observe" or not self.pending:
             self.pending = {}
             return
@@ -404,14 +528,16 @@ class Planner:
             # program band matched the declared program. Instrument efficiency does not enter the band.
             multiplier_seen = score / self.weight[i]
             self.cur[i] = max(self.cur[i], multiplier_seen)
-            if abs(multiplier_seen - declared) < 2e-4:
+            if self.shared_quality and multiplier_seen > self.mismatch+2e-4:
+                band_samples.append(prediction['model'])
+            elif not self.shared_quality and abs(multiplier_seen - declared) < 2e-4:
                 self.band_obs.append((hours, prediction["model"], self.pending_program, True, prediction["dir_clean"]))
-            elif abs(multiplier_seen - self.mismatch) < 2e-4:
+            elif not self.shared_quality and abs(multiplier_seen - self.mismatch) < 2e-4:
                 self.band_obs.append((hours, prediction["model"], self.pending_program, False, prediction["dir_clean"]))
             factor_if_match = score / (self.weight[i] * declared)
             factor_if_miss = score / (self.weight[i] * self.mismatch)
             ratio_match = factor_if_match * self.f0t0 / (self.flux[i] * self.pending_duration * prediction["model"])
-            matched = self._band(ratio_match * prediction["band_model"]) == self.pending_program
+            matched = (self.shared_quality and multiplier_seen > self.mismatch+2e-4) or self._band(ratio_match * prediction["band_model"]) == self.pending_program
             factor = factor_if_match if matched else factor_if_miss
             self.factor[i] = max(self.factor[i], min(1.0, factor))
             if self.required[i] and self.factor[i] < self.required_threshold:
@@ -419,12 +545,27 @@ class Planner:
                 if pred > 0 and factor < 0.97:
                     self.req_calib[i] = min(1.0, max(0.3, factor / pred)) ** REQ_CALIB_POWER
                 self.attempts[i] += 1  # not enough yet: lower its priority a little for next time
-            if factor < 0.97:
+            ambiguous_saturation = self.shared_quality and .97 <= factor_if_miss <= 1.0002 and factor_if_match <= 1.0
+            if factor < 0.97 and not ambiguous_saturation:
                 ratio = factor * self.f0t0 / (self.flux[i] * self.pending_duration * prediction["model"])
-                self.samples.append((hours, ratio))
-                self.all_ratios.append(ratio)
-                if prediction["dir_clean"]:
-                    self.e_ratios.append((hours, ratio))
+                if self.shared_quality:
+                    exposure_samples.append(ratio)
+                    if prediction['clean']:clean_samples.append(ratio)
+                else:
+                    self.samples.append((hours, ratio))
+                    self.all_ratios.append(ratio)
+                    if prediction["dir_clean"]:
+                        self.e_ratios.append((hours, ratio))
+        if self.shared_quality:
+            if exposure_samples:
+                ratio = sorted(exposure_samples)[len(exposure_samples)//2]
+                self.samples.append((hours,ratio));self.all_ratios.append(ratio)
+            if clean_samples:
+                self.latest_clean_ratio = sorted(clean_samples)[len(clean_samples)//2]
+                self.e_ratios.append((hours,self.latest_clean_ratio))
+            if band_samples:
+                model = sorted(band_samples)[len(band_samples)//2]
+                self.band_obs.append((hours,model,self.pending_program,True,bool(clean_samples)))
         self._offset_evidence(hits)
         self.pending = {}
         self.update_scale(hours)
@@ -532,7 +673,7 @@ class Planner:
             # few saturated hits lately (poor quality, or an instrument fault): the band does not follow the
             # instrument, so keep fitting the latest saturated hits instead of the quality level
             recent = [item for item in self.band_obs if item[0] >= hours - BAND_FALLBACK_HOURS][-8:]
-        if len(recent) < 4:
+        if len(recent) < (1 if self.shared_quality else 4):
             return guess
         # among equally consistent levels prefer the one closest to the last fitted level (the sky band moves
         # with the weather, not with the instrument), else to the quality-based guess
@@ -573,7 +714,9 @@ class Planner:
             ordered = sorted(self.all_ratios)
             self.prior_scale = ordered[len(ordered) // 2]
         recent = sorted(ratio for when, ratio in self.samples if when >= hours - SKY_MEMORY_HOURS)
-        self.scale = max(0.05, recent[len(recent) // 2]) if len(recent) >= 4 else self.prior_scale
+        # One shared exposure is already an aggregate of its fibres. Requiring
+        # four exposures in two hours silently discards feedback on long turns.
+        self.scale = max(0.05, recent[len(recent) // 2]) if len(recent) >= (1 if self.shared_quality else 4) else self.prior_scale
 
     def _band(self, q_band: float) -> str:
         if q_band >= float(self.bands["DARK"]):
@@ -591,6 +734,9 @@ class Planner:
         self.samples.clear()
         self.all_ratios.clear()
         self.prior_scale = 1.0
+        self.scale = 1.0
+        self.band_obs.clear()
+        self.band_level = None
 
     # --- planning --------------------------------------------------------------------------------
 
@@ -661,6 +807,8 @@ class Planner:
             self._season_plan(now, night_index)
         self.update_scale(hours)
         self.night_index = night_index
+        self.metrics = {'level': self.fast_level, 'joint_program': self.joint_program,
+                        'integration': self.exposure_model is not None}
         lst = local_sidereal_deg(now, self.lon)
         horizon = min(night_end, self.survey_end)
         seconds_left = (horizon - now).total_seconds()
@@ -676,7 +824,7 @@ class Planner:
             if not self.e_hours or self.e_hours[-1][0] != hour:
                 self.e_hours.append((hour, night_index, []))
             self.e_hours[-1][2].append(e_now)
-        min_up = min(MIN_VISIBLE_SECONDS, seconds_left)
+        min_up = min(self.min_exposure if self.protect_required else MIN_VISIBLE_SECONDS, seconds_left)
         level = self.fast_level
         base = {}
         visible = {}
@@ -715,7 +863,8 @@ class Planner:
             visible[i] = None
             # proxy priority: planning value x a rough airmass factor x urgency (no Moon, no direction)
             nights_left = self.last_night[i] - night_index + 1
-            proxy.append((v * (sin_alt ** 0.6) * (1.0 + URGENCY / (nights_left if nights_left > 1 else 1)), i))
+            proxy.append((v * (sin_alt ** 0.6) * (1.0 + URGENCY / (nights_left if nights_left > 1 else 1))
+                          * self.required_urgency(i,night_index), i))
             if N_DENSE:
                 # plain science still to gain here, binned on the sky at roughly one field size
                 key = (int((self.ra[i] * cd[i]) // DENSE_BIN_DEG), int((self.dec[i] + 90.0) // DENSE_BIN_DEG))
@@ -740,7 +889,8 @@ class Planner:
                 up = (h - ha) / SIDEREAL_DEG_PER_SECOND if h < 180.0 else 1e9
                 lunar = moon.lunar_factor(self.ra[i], self.dec[i])
                 nights_left = max(1, self.last_night[i] - night_index + 1)
-                damp = 0.6 ** self.misses[i] * 0.8 ** self.attempts[i]
+                rescue = self.protect_required and self.required[i] and self.factor[i] < self.required_threshold
+                damp = 0.6 ** min(self.misses[i], 3 if rescue else 100) * (1.0 if rescue else 0.8 ** self.attempts[i])
                 item = base[i] = (alt, az, lunar, up, (1.0 + URGENCY / nights_left) * damp * dirf)
             return item
 
@@ -770,26 +920,34 @@ class Planner:
             return top_mult * (v / top_mult) ** KAPPA if KAPPA != 1.0 else v
 
         @lru_cache(maxsize=None)
-        def gain(i, T):
+        def exposure(i, T):
+            alt, az, m0, m1, up, mult = full(i)
+            model = self.exposure_model.average(i,T) if self.exposure_model else m0 + (m1-m0)*min(1.0,T/3600.0)
+            return model, min(1.0,self.flux[i]*T*model*scale/self.f0t0)
+
+        @lru_cache(maxsize=None)
+        def gain(i, T, program=None):
             alt, az, m0, m1, up, mult = full(i)
             if up < T:
                 return 0.0
-            model = m0 + (m1 - m0) * min(1.0, T / 3600.0)
-            reach = min(1.0, self.flux[i] * T * model * scale / self.f0t0)
-            m = self.multipliers[self._band(model * band_scale)]
+            model, reach = exposure(i,T)
+            band = self._band(model * band_scale)
+            m = self.multipliers[band] if program is None or program == band else self.mismatch
             g = self.weight[i] * max(0.0, shaped(reach * m) - shaped(self.cur[i]))
+            g *= self.science_weights.get(i,1.0)
             if reach < PARTIAL_DONE and self.planned[i] and self.last_night[i] - night_index >= PARTIAL_NIGHTS:
                 g *= PARTIAL_DISCOUNT   # it will be completed later: this partial exposure would be wasted
             if self.required[i] and self.factor[i] < self.required_threshold:
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / max(1e-9,self.required_threshold) * self.req_calib.get(i, 1.0)
                 bonus = self.required_bonus * self.required_priority * min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
-                target_best = self.best_future_model(i, night_index) if REQ_CALENDAR else self.ideal_model[i]
-                if REQ_TIMING and model < REQ_TIMING * target_best and self.last_night[i] - night_index >= REQ_TIMING_NIGHTS:
+                target_best = self.best_future_model(i, night_index) if REQ_CALENDAR or self.protect_required else self.ideal_model[i]
+                opportunities = self.remaining_opportunities(i,night_index) if self.protect_required else self.last_night[i]-night_index+1
+                if REQ_TIMING and model < REQ_TIMING * target_best and opportunities > REQ_TIMING_NIGHTS:
                     bonus *= REQ_TIMING_DISCOUNT   # a better moment for this target will come
-                if self.bad_forecast and self.last_night[i] - night_index >= REQ_TIMING_NIGHTS:
+                if self.bad_forecast and opportunities > REQ_TIMING_NIGHTS:
                     bonus *= FORECAST_DISCOUNT     # tonight is forecast bad over the whole sky
-                g += bonus
-            if i in self.request_terms:
+                g += bonus * self.required_urgency(i,night_index)
+            if program is None and i in self.request_terms:
                 g += self._window_request_value(i,T,model,now)
             return g * mult
 
@@ -836,9 +994,26 @@ class Planner:
         ranked.sort(reverse=True)
         n_anchors = (N_ANCHORS, 3, 1, 1)[min(level, 3)]
         anchors = [i for _, i in ranked[:n_anchors]]
-        if N_DENSE and level <= 1 and bins:
+        if self.protect_required:
+            # Share a bounded threshold set across fields. Per-field unique
+            # durations otherwise multiply the integration/gain cache quadratically.
+            rescue = sorted((i for _,i in ranked if self.required[i] and self.factor[i]<self.required_threshold),
+                            key=lambda i:(self.remaining_opportunities(i,night_index),-self.flux[i]))[:6]
+            extra = {min(self.max_exposure,int(seconds_left))}
+            for i in rescue:
+                model,_ = exposure(i,min(self.max_exposure,int(seconds_left)))
+                t = self.threshold_duration(i,model,scale,self.required_threshold)
+                if self.min_exposure<=t<=min(self.max_exposure,seconds_left,full(i)[4]):
+                    extra.add(t)
+            durations = sorted(set(durations)|extra)
+        if self.diverse_search:
+            for candidates in ([i for _,i in ranked if self.required[i] and self.factor[i]<self.required_threshold],
+                               [i for _,i in ranked if i in self.request_terms]):
+                if candidates and candidates[0] not in anchors:
+                    anchors.append(candidates[0])
+        if N_DENSE and (level <= 1 or self.diverse_search) and bins:
             # also try the densest patches of remaining science: fields with no single outstanding target
-            for _, key in heapq.nlargest(N_DENSE if level == 0 else 2, ((v, k) for k, v in bins.items())):
+            for _, key in heapq.nlargest(N_DENSE if level == 0 else (3 if self.diverse_search else 2), ((v, k) for k, v in bins.items())):
                 j = bin_best[key][1]
                 if j not in anchors and exact(j) is not None:
                     anchors.append(j)
@@ -849,42 +1024,114 @@ class Planner:
         best_rate_here = 0.0
         best_rate = [0.0]
 
+        # Unit vectors are shared by all trial pointings; projection is still exact.
+        vectors = {}
+        projected_fields = [0]
+        evaluated_options = [0]
+
+        @lru_cache(maxsize=None)
+        def request_gain(j,T):
+            if j not in self.request_terms or full(j)[4]<T:
+                return 0.0
+            return self._window_request_value(j,T,exposure(j,T)[0],now)
+
         def evaluate(c_alt, c_az, near, durations):
             """Best (net, T, pick, total) for one pointing, or None."""
             cells: dict = {}
+            ca,sa = math.cos(math.radians(c_alt)),math.sin(math.radians(c_alt))
+            cz,sz = math.cos(math.radians(c_az)),math.sin(math.radians(c_az))
+            projected_fields[0] += 1
             for j in near:
-                offsets = tangent_offsets(base[j][0], base[j][1], c_alt, c_az)
+                if self.diverse_search:
+                    if j not in vectors:
+                        a,z = map(math.radians,base[j][:2])
+                        vectors[j] = (math.cos(a)*math.cos(z),math.cos(a)*math.sin(z),math.sin(a))
+                    x,y,z = vectors[j]
+                    dot = x*ca*cz+y*ca*sz+z*sa
+                    offsets = (math.degrees((-x*sa*cz-y*sa*sz+z*ca)/dot),
+                               math.degrees((-x*sz+y*cz)/dot)) if dot>0 else None
+                else:
+                    offsets = tangent_offsets(base[j][0], base[j][1], c_alt, c_az)
                 if offsets is None:
                     continue
                 fib, margin = self.grid.classify(*offsets)
-                if fib is None or margin < EDGE_MARGIN_DEG * (0.5 + 1.5 * self.misses[j]):
+                edge = min(EDGE_MARGIN_DEG,self.grid.glass*.15) if self.diverse_search else EDGE_MARGIN_DEG
+                if fib is None or margin < edge * (0.5 + 1.5 * min(3,self.misses[j])):
                     continue
                 cells.setdefault(fib, []).append(j)
             if not cells:
                 return None
             found = None
             for T in durations:
-                total = 0.0
-                pick = {}
-                for fib, js in cells.items():
-                    g, j = max((gain(j, T), j) for j in js)
-                    if g > 0:
-                        total += g
-                        pick[fib] = j
-                if not pick:
-                    continue
-                if total / T > best_rate[0]:
-                    best_rate[0] = total / T
-                net = total - lam * T
-                if found is None or net > found[0]:
-                    found = (net, T, pick, total)
+                if T < min(self.min_progress_seconds,seconds_left):
+                    imminent = any(self.required[j] and self.factor[j]<self.required_threshold
+                                   and (full(j)[4]<self.min_progress_seconds or self.remaining_opportunities(j,night_index)<=1)
+                                   for js in cells.values() for j in js)
+                    urgent_request = any(g['deadline'] and (g['deadline']-now).total_seconds()<self.min_progress_seconds
+                                         for g in self.request_groups)
+                    if not imminent and not urgent_request:
+                        continue
+                # Programs matching no possible assignment are dominated. This
+                # is exact pruning, not a heuristic change to the objective.
+                programs = (self.force_program,) if self.force_program else sorted({
+                    self._band(exposure(j,T)[0]*band_scale) for js in cells.values() for j in js if full(j)[4]>=T})
+                for program in (programs if self.joint_program else (None,)):
+                    evaluated_options[0] += 1
+                    total = 0.0
+                    pick = {}
+                    for fib, js in cells.items():
+                        # Request credit guides assignment; field credit is capped below.
+                        g,j = max((gain(j,T,program) + (request_gain(j,T) if program is not None else 0.0),j) for j in js)
+                        if g > 0:
+                            total += gain(j,T,program)
+                            pick[fib] = j
+                    if not pick:
+                        continue
+                    if self.request_groups and program is not None:
+                        # Improve assignments against the whole capped request,
+                        # not independently duplicated per-target reward. This
+                        # bounded coordinate pass also keeps extra fibres useful
+                        # after a request's remaining count has been filled.
+                        factors = {j:exposure(j,T)[1] for j in pick.values()}
+                        credit = self.request_value(factors,now,T)
+                        for fib,js in cells.items():
+                            previous = pick.get(fib)
+                            if previous is None or len(js)<2:
+                                continue
+                            old_gain = gain(previous,T,program)
+                            best_j,best_delta,best_credit = previous,0.0,credit
+                            factors.pop(previous,None)
+                            for j in js:
+                                if j==previous or full(j)[4]<T:
+                                    continue
+                                factors[j] = exposure(j,T)[1]
+                                next_credit = self.request_value(factors,now,T)
+                                delta = gain(j,T,program)-old_gain+next_credit-credit
+                                factors.pop(j,None)
+                                if delta>best_delta:
+                                    best_j,best_delta,best_credit = j,delta,next_credit
+                            pick[fib] = best_j
+                            factors[best_j] = exposure(best_j,T)[1]
+                            total += gain(best_j,T,program)-old_gain
+                            credit = best_credit
+                    if program is not None:
+                        total += self.request_value({j:exposure(j,T)[1] for j in pick.values()},now,T)
+                    elif self.group_requests:
+                        total -= sum(self._window_request_value(j,T,exposure(j,T)[0],now)*full(j)[5] for j in pick.values())
+                        total += self.request_value({j:exposure(j,T)[1] for j in pick.values()},now,T)
+                    if total / T > best_rate[0]:
+                        best_rate[0] = total / T
+                    net = total - lam * T
+                    if found is None or net > found[0]:
+                        found = (net,T,pick,total,program)
             return found
 
         best_near = None
         n_value_anchors = min(len(anchors), n_anchors)
         for rank, anchor in enumerate(anchors):
             a_alt, a_az = base[anchor][0], base[anchor][1]
-            near = [j for j in self.neighbours(self.ra[anchor], self.dec[anchor], NEIGHBOUR_RADIUS_DEG*self.grid.fov/2.5) if j in visible and exact(j) is not None]
+            radius = self.grid.fov*1.45 if self.diverse_search else NEIGHBOUR_RADIUS_DEG*self.grid.fov/2.5
+            near = [j for j in self.neighbours(self.ra[anchor], self.dec[anchor], radius) if j in visible and exact(j) is not None]
             # density anchors mark a patch, not a target to centre: a few central placements, then refine
             for fiber in (fibers if rank < n_value_anchors else dense_fibers):
                 d_north, d_east = self.grid.fiber_center(fiber)
@@ -894,7 +1141,7 @@ class Planner:
                 c_alt, c_az = round(c_alt, 4), round(c_az, 4) % 360.0
                 found = evaluate(c_alt, c_az, near, durations)
                 if found is not None and (best is None or found[0] > best[0]):
-                    best = (found[0], c_alt, c_az, found[1], found[2], found[3])
+                    best = (found[0], c_alt, c_az, found[1], found[2], found[3],found[4])
                     best_near = near
         if best is not None and REFINE_STEPS and level == 0:
             # local search: nudge the winning pointing to catch targets near the cell edges
@@ -908,7 +1155,7 @@ class Planner:
                     c_alt, c_az = round(c_alt, 4), round(c_az, 4) % 360.0
                     found = evaluate(c_alt, c_az, best_near, (best[3],) if REFINE_FIXED_T else durations)
                     if found is not None and found[0] > best[0] + 1e-9:
-                        best = (found[0], c_alt, c_az, found[1], found[2], found[3])
+                        best = (found[0], c_alt, c_az, found[1], found[2], found[3],found[4])
                         improved = True
                 if not improved:
                     break
@@ -919,21 +1166,25 @@ class Planner:
                 self._dbgnone = int(hours)
                 self.log(f"plan none: info={len(info)} ranked={len(ranked)} scale={self.scale:.3f} lam={lam:.4f} best={best and best[:1]}")
             return None
-        _, c_alt, c_az, T, pick, _ = best
+        _, c_alt, c_az, T, pick, _, selected_program = best
         # program: maximise expected score over the assigned targets
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
         for fib, j in pick.items():
             alt, az, m0, m1, up, _ = info[j]
-            model = m0 + (m1 - m0) * min(1.0, T / 3600.0)
-            reach = min(1.0, self.flux[j] * T * model * scale / self.f0t0)
+            model,reach = exposure(j,T)
             votes[self._band(model * band_scale)] += self.weight[j] * reach + (0.05 * self.required_bonus if self.required[j] else 0.0)
         total_votes = sum(votes.values())
-        program = self.force_program or max(votes, key=lambda p: (votes[p] * self.multipliers[p] + (total_votes - votes[p]) * self.mismatch, p))
+        program = selected_program or self.force_program or max(votes, key=lambda p: (votes[p] * self.multipliers[p] + (total_votes - votes[p]) * self.mismatch, p))
+        self.metrics.update({'fields':projected_fields[0], 'options':evaluated_options[0], 'anchors':len(anchors),
+            'net_gain':best[0], 'planning_gain':best[5],
+            'min_progress_seconds':self.min_progress_seconds,
+            'assigned':len(pick), 'request_value':self.request_value({j:exposure(j,T)[1] for j in pick.values()},now,T),
+            'required_pending':sum(self.required[i] and self.factor[i]<self.required_threshold for i in self.active)})
         clean = not self.all_sky_notice()
         self.pending = {}
         for fib, j in pick.items():
             alt, az, m0, m1, up, _ = info[j]
-            model = m0 + (m1 - m0) * min(1.0, T / 3600.0)
+            model,_ = exposure(j,T)
             dir_clean = self._direction_factor(alt, az) >= 1.0
             self.pending[self.ids[j]] = {"model": model, "band_model": model / 0.95, "alt": alt, "az": az,
                                         "pred": self.flux[j] * T * model * self.scale / self.f0t0,

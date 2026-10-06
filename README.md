@@ -1,5 +1,7 @@
 # Agentic Observer — 原生 V4 参赛项目
 
+八卡改造、消融开关及单次平台验证约束见 [ROBUSTNESS_ZH.md](docs/ROBUSTNESS_ZH.md)。
+
 当前正式入口为 `agent/agent.py`，协议为 `participant-agent-protocol-v4`。
 运行只依赖 Python 3.9+ 标准库，不需要 LangChain、LangGraph 或安装模型 SDK。
 
