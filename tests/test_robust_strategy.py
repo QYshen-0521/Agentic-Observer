@@ -188,6 +188,42 @@ class RobustStrategyTests(unittest.TestCase):
                 p._maybe_report(12+n*.1,request());self.assertEqual(p.state.force_program,'DARK')
             p._maybe_report(12.6,request());self.assertIsNone(p.state.force_program)
 
+    def test_persistent_earthquake_notice_does_not_blind_later_faults(self):
+        p=Planner(SurveyState(initial()))
+        p._quake_active=True
+        p.earthquake_until=12
+        p._pro.on_messages([],{'notices':[{'event_kind':'earthquake','direction':'ALL'}]})
+        p.plan(self.now,self.now+timedelta(hours=6),0,1)
+        self.assertTrue(p.state.pending)
+        self.assertTrue(all(not x.clean for x in p.state.pending.values()))
+        p.plan(self.now,self.now+timedelta(hours=6),0,13)
+        self.assertTrue(any(x.clean for x in p.state.pending.values()))
+
+    def test_short_exposures_do_not_starve_fault_evidence(self):
+        s=SurveyState(initial())
+        s.clean_history=[(i*.2,0,1.0) for i in range(30)]
+        s.clean_history += [(24+i*.1,1,.2) for i in range(40)]
+        e=s.fault_evidence()
+        self.assertIsNotNone(e)
+        self.assertGreater(e.recent_samples,12)
+        self.assertGreaterEqual(e.earlier_samples,24)
+        self.assertLess(e.drop,.3)
+        self.assertGreaterEqual(s.clean_history[-1][0]-s.clean_history[-e.recent_samples][0],3)
+
+    def test_fault_window_retains_baseline_and_span_requirements(self):
+        s=SurveyState(initial())
+        s.clean_history=[(i*.01,0,.2) for i in range(60)]
+        self.assertIsNone(s.fault_evidence())
+
+    def test_cell_cache_preserves_live_action_with_requests(self):
+        data=initial(5)
+        actions=[]
+        for cache in (False,True):
+            p=Planner(SurveyState(data));p._pro.cache_cells=cache
+            payload=request();payload['active_requests']=[self.make_request(need=2)]
+            actions.append(p.decide(payload))
+        self.assertEqual(actions[0],actions[1])
+
     def test_calibration_expands_beyond_old_search_box(self):
         s=SurveyState(initial());c=PointingCalibration(s.fiber_grid);rng=random.Random(21)
         expected=(s.fiber_grid.pitch*1.7,-s.fiber_grid.pitch*1.4)

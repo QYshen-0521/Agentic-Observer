@@ -62,6 +62,7 @@ class SurveyState:
     def __init__(self, init_payload: dict):
         self.public_init = init_payload
         self.shared_quality = enabled('quality')
+        self.timed_fault_window = enabled('fault')
         site = init_payload["site"]
         survey = init_payload["survey"]
         instrument = init_payload["instrument"]
@@ -422,8 +423,16 @@ class SurveyState:
         history = self.clean_history
         if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
             return None
-        recent = history[-RECENT_SAMPLES:]
-        earlier = history[:-RECENT_SAMPLES]
+        split = len(history) - RECENT_SAMPLES
+        if self.timed_fault_window:
+            # Short exposures can keep the last twelve samples inside three
+            # hours forever. Extend backwards until BOTH the independent-sample
+            # count and time span are met, retaining the baseline sample reserve.
+            cutoff = history[-1][0] - 3.0
+            while split > EARLIER_SAMPLES and history[split][0] > cutoff:
+                split -= 1
+        recent = history[split:]
+        earlier = history[:split]
         span = recent[-1][0] - recent[0][0]
         nights = len({night for _, night, _ in recent})
         if span < 3.0:

@@ -228,10 +228,14 @@ class Planner:
         self.calibration.record(action, self.state.pending, self.state.min_alt)
         self._diagnostic_turn += 1
         if self._diagnostic_turn % 128 == 0:
+            evidence = self.state.fault_evidence()
             metrics = {'turn':self._diagnostic_turn,'observes':self.observe_count,'reports':self.reports,
                 'repairs':self.repairs,'false_since_repair':self.false_reports,'assigned':self.total_assigned,
                 'hit':self.total_hit,'level':self.state.fast_level,'cpu_left':self.clock.cpu_left,
                 'wall_left':self.clock.wall_left,'scale':self.state.scale,'band_scale':self.state.band_scale,
+                'fault_evidence': evidence._asdict() if evidence else None,
+                'clean_exposures': len(self.state.clean_history),
+                'earthquake_gate': getattr(self,'_hours',0) < self.earthquake_until,
                 'model_calls':getattr(self.llm,'calls_made',0), 'search':self._pro.metrics}
             self.log('planner-metrics: '+json.dumps(metrics,sort_keys=True))
             self.trace.write({'event':'planner_metrics',**metrics})
@@ -585,7 +589,7 @@ class Planner:
             factor = min(1.0,prediction['pred'])
             band = p._band(prediction['model']*band_scale)
             score = state.weight[i]*factor*state.scoring.program_multiplier(action['program'],band)
-            if self.robust_faults and (hours<self.earthquake_until or getattr(self,'_quake_active',False)):
+            if self.robust_faults and hours < self.earthquake_until:
                 prediction['clean'] = False
             predictions[target_id] = PendingPrediction(prediction['model'],prediction['band_model'],prediction['alt'],prediction['az'],prediction['clean'],max(0,score-state.best_score[i]))
         state.pending = predictions

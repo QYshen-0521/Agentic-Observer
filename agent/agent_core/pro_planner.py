@@ -133,6 +133,7 @@ class Planner:
         self.exposure_model = None
         self.science_weights = {}
         self.metrics = {}
+        self.cache_cells = True
         self.min_progress_seconds = 0.0
         site = init["site"]
         self.lat = float(site["latitude_deg"])
@@ -1035,6 +1036,31 @@ class Planner:
                 return 0.0
             return self._window_request_value(j,T,exposure(j,T)[0],now)
 
+        @lru_cache(maxsize=None)
+        def cell_choice(targets, T, program):
+            # Adjacent pointings repeatedly produce the same fibre membership.
+            # Geometry only determines membership; gain depends on this decision,
+            # duration and program, so the exact winner is reusable across fields.
+            return max((gain(j,T,program) + (request_gain(j,T) if program is not None else 0.0),j)
+                       for j in targets)
+
+        program_names = tuple(sorted(self.multipliers))
+        program_bits = {name:1 << i for i,name in enumerate(program_names)}
+        program_sets = {mask:tuple(name for name in program_names if mask & program_bits[name])
+                        for mask in range(1 << len(program_names))}
+
+        @lru_cache(maxsize=None)
+        def cell_programs(targets, T):
+            mask = 0
+            for j in targets:
+                if full(j)[4] >= T:
+                    mask |= program_bits[self._band(exposure(j,T)[0]*band_scale)]
+            return mask
+
+        if not self.cache_cells:
+            cell_choice = cell_choice.__wrapped__
+            cell_programs = cell_programs.__wrapped__
+
         def evaluate(c_alt, c_az, near, durations):
             """Best (net, T, pick, total) for one pointing, or None."""
             cells: dict = {}
@@ -1061,6 +1087,7 @@ class Planner:
                 cells.setdefault(fib, []).append(j)
             if not cells:
                 return None
+            cells = {fib:tuple(js) for fib,js in cells.items()}
             found = None
             for T in durations:
                 if T < min(self.min_progress_seconds,seconds_left):
@@ -1073,15 +1100,22 @@ class Planner:
                         continue
                 # Programs matching no possible assignment are dominated. This
                 # is exact pruning, not a heuristic change to the objective.
-                programs = (self.force_program,) if self.force_program else sorted({
-                    self._band(exposure(j,T)[0]*band_scale) for js in cells.values() for j in js if full(j)[4]>=T})
+                programs = (None,)
+                if self.joint_program:
+                    mask = 0
+                    if self.force_program:
+                        programs = (self.force_program,)
+                    else:
+                        for js in cells.values():
+                            mask |= cell_programs(js,T)
+                        programs = program_sets[mask]
                 for program in (programs if self.joint_program else (None,)):
                     evaluated_options[0] += 1
                     total = 0.0
                     pick = {}
                     for fib, js in cells.items():
                         # Request credit guides assignment; field credit is capped below.
-                        g,j = max((gain(j,T,program) + (request_gain(j,T) if program is not None else 0.0),j) for j in js)
+                        g,j = cell_choice(js,T,program)
                         if g > 0:
                             total += gain(j,T,program)
                             pick[fib] = j
