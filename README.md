@@ -4,7 +4,7 @@
 运行只依赖 Python 3.9+ 标准库，不需要 LangChain、LangGraph 或安装模型 SDK。
 
 2026-10-06 优化交接请先读 [HANDOFF_ZH.md](HANDOFF_ZH.md)：当前采用 Pro 衍生搜索核心，
-45 项测试通过；本地核心四卡均分 6521.48，尚无当前版本正式成绩，尚未超过第一名。
+45 项测试通过；最终源码本地四卡均分 6520.17，尚无当前版本正式成绩，尚未超过第一名。
 
 ```powershell
 python -m unittest discover -s tests -v
