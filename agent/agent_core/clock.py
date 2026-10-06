@@ -37,6 +37,7 @@ class Clock:
         self.level_cost = [0.06, 0.02, 0.008]
         self.level_seen = [False] * 3
         self.search_cost = self.level_cost[:]
+        self._search_samples = [deque(maxlen=64) for _ in range(3)]
         self.last_search_cost = 0.0
         self._overheads = deque(maxlen=64)
         self.advances = deque(maxlen=64)
@@ -93,8 +94,12 @@ class Clock:
         level = self.level
         self._overheads.append(max(0.0, self.last_cost-self.last_search_cost))
         overhead = statistics.median(self._overheads)
-        self.search_cost[level] = (0.85*self.search_cost[level]+0.15*self.last_search_cost
-                                  if self.level_seen[level] else max(.001,self.last_search_cost))
+        # Search size varies between fields. A short burst of expensive fields
+        # must not predict that every remaining night will have the same cost.
+        # The per-level median also resists coarse Windows CPU timer samples;
+        # sustained increases still replace the bounded window promptly.
+        self._search_samples[level].append(self.last_search_cost)
+        self.search_cost[level] = max(.001, statistics.median(self._search_samples[level]))
         self.level_cost = [cost+overhead for cost in self.search_cost]
         self.level_seen[level] = True
         self._ended_wall = time.monotonic()

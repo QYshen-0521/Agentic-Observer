@@ -66,6 +66,26 @@ class PacingTests(unittest.TestCase):
                 c.end_decision()
         self.assertLess(c.level_cost[0],.03)
 
+    def test_transient_search_spike_and_sustained_cost_increase(self):
+        c = Clock()
+        timer = 0.0
+        def observe(cost):
+            nonlocal timer
+            with patch('agent_core.clock.time.process_time',side_effect=[timer,timer+cost]), \
+                 patch('agent_core.clock.time.monotonic',side_effect=[timer,timer+cost]):
+                c.start_decision()
+                c.last_search_cost = cost
+                c.end_decision()
+            timer += cost
+        for _ in range(20):
+            observe(.02)
+        for _ in range(3):
+            observe(.2)
+        self.assertLess(c.level_cost[0],.03)
+        for _ in range(25):
+            observe(.2)
+        self.assertGreater(c.level_cost[0],.19)
+
 
 class ExposureAndYieldTests(unittest.TestCase):
     def test_resync_gain_reflects_removed_scores(self):
