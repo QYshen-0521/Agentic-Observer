@@ -535,9 +535,9 @@ class Planner:
             f = state.factor[i]
             program = scoring.program_band(model * state.band_scale)
             gain = max(0.0, state.weight[i] * reach * scoring.program_multipliers[program] - state.best_score[i])
-            exempt = (state.required[i] and f < scoring.required_threshold) or i in self._request_bonus
-            if not exempt:
-                gain *= state.science_weight(i, hours)
+            # Keep the coarse field shortlist optimistic. Apply stagnation to
+            # actual joint plans below, so uncertain quality does not prematurely
+            # remove potentially useful fields from the bounded shortlist.
             gain += self._request_bonus.get(i, 0.0) if reach >= self._request_thresholds_now.get(i, 1.0) else 0.0
             if state.required[i] and f < scoring.required_threshold and reach >= scoring.required_threshold:
                 gain += self.required_bonus * self.required_priority
@@ -652,18 +652,7 @@ class Planner:
                 if k > 0:
                     for threshold in (1.0, scoring.required_threshold if state.required[j] else 1.0,
                                       self._request_thresholds_now.get(j, 1.0)):
-                        duration = math.ceil(threshold / k / 30) * 30
-                        durations.add(duration)
-                        # Recompute completion boundaries with their own exposure
-                        # average, rather than only the initial quality estimate.
-                        if self._exposure_model is not None:
-                            for _ in range(2):
-                                if not state.min_exposure <= duration <= limit:
-                                    break
-                                average = self._exposure_model.average(j,duration)
-                                rate = state.flux[j]*average*state.scale*PLAN_FACTOR_SAFETY/scoring.f0t0
-                                duration = math.ceil(threshold/max(1e-9,rate)/30)*30
-                                durations.add(duration)
+                        durations.add(math.ceil(threshold / k / 30) * 30)
                 durations.add(int(min(limit, up)))
         best = None
         programs = (state.force_program,) if state.force_program else ('DARK', 'BRIGHT', 'BACKUP')
@@ -682,6 +671,7 @@ class Planner:
             for program in programs:
                 assignments, predictions = {}, {}
                 gain = 0.0
+                request_credits = [0.0] * len(self._request_groups)
                 for fiber, options in info.items():
                     best_target = None
                     for item in options:
@@ -709,12 +699,21 @@ class Planner:
                     value, item, reached, integrated_model, score = best_target
                     j, alt, az, model, up, k, band, margin = item
                     gain += value
+                    edge_weight = 1.0 if margin >= EDGE_MARGIN_DEG else 0.65
+                    for group_index, group in enumerate(self._request_groups):
+                        if (j in group['targets'] and reached >= group['threshold']
+                            and now+timedelta(seconds=duration) <= group['deadline']):
+                            request_credits[group_index] += 0.65*group['reward']/group['remaining']*edge_weight
                     assignments[str(fiber)] = state.ids[j]
                     predictions[state.ids[j]] = PendingPrediction(integrated_model, integrated_model / 0.95, alt, az,
                         clean and self._direction_factor(alt, az) >= 1.0,
                         max(0.0, score-state.best_score[j]))
                 if not assignments:
                     continue
+                # A shared exposure can meet more alternatives than necessary,
+                # but a request settles its reward only once.
+                gain -= sum(max(0.0,credit-0.65*group['reward'])
+                            for credit,group in zip(request_credits,self._request_groups))
                 rate = gain / duration
                 if best is None or rate > best[0]:
                     best = (rate, {'action': 'observe', 'pointing': {'alt_deg': c_alt, 'az_deg': c_az},

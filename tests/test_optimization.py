@@ -127,6 +127,22 @@ class ExposureAndYieldTests(unittest.TestCase):
 
 
 class RequestSchedulingTests(unittest.TestCase):
+    def test_shared_exposure_cannot_collect_one_request_reward_twice(self):
+        from agent_core.geometry import Moon, radec_to_altaz
+        s = SurveyState(initial())
+        p = Planner(s)
+        now = parse_utc(request()['now_utc'])
+        lst = local_sidereal_deg(now,s.lon)
+        alt,az = radec_to_altaz(s.ra[0],s.dec[0],lst,s.lat)
+        for i in [0,1]:
+            s.required[i] = False
+            s.best_score[i] = s.weight[i]*1.2
+        p._request_groups = [{'targets':{0,1},'remaining':1,'threshold':.01,
+                             'reward':100,'deadline':now+timedelta(hours=1)}]
+        plan = p._finish_plan(now,lst,alt,az,{0:[(1,0,.2)],1:[(1,1,.2)]},3600,
+                             Moon(now,lst,s.lat),lambda i:(alt,az),0,0)
+        self.assertAlmostEqual(plan[0],65/s.min_exposure)
+
     def make_request(self, now, ids, need, seconds):
         return {'request_id':'R1','target_ids':ids,'completed_target_ids':[],
                 'remaining_count':need, 'completion_factor_threshold':.5,

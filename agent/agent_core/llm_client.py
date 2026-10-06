@@ -21,6 +21,9 @@ with exponential backoff plus random jitter, honouring `Retry-After`. In the hid
 a card's 3 repeats run at the same time on the same key, so 429s are to be expected; the
 jitter keeps the repeats from retrying in lockstep. If a question still fails, that one
 planning step falls back to its rule-based answer -- the next night's calls run normally.
+Connected notice/planning pairs share at most 24 s, with at most 12 s per stage
+and one request reserved for the second stage; some waiting budget is retained
+for later condition changes. Fault confirmation uses the ordinary question limit.
 
 Standard library only (urllib) so the example has zero third-party dependencies.
 """
