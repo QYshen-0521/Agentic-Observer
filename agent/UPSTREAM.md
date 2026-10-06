@@ -44,3 +44,10 @@ https://create.gosim.org/survey26/platform/downloads/examples/python.zip
 - 使用完成质量代理指导规划，真实反馈账本和预测科学增量保持线性得分。
 - 公开几何使用五分钟插值节点共享计算，保留公开时段中点积分及单次决策缓存隔离。
 - 增加不同网格、高仰角重投影、相位填充及公开插值回归测试。
+
+2026-10-06 Pro 核心交接版本：
+
+- 新的运行搜索 `pro_planner.py` 和 `pro_skymath.py` 改编自 [GOSIM 2026 Agentic Observer Hackathon](https://create.gosim.org/survey26/) 的 [Python Pro 示例](https://github.com/gosimfoundation/hackathon-survey26/tree/483e8f63a79008236a81810ab9c7dfef081a2abf/examples/python-pro)，源提交 `483e8f63a79008236a81810ab9c7dfef081a2abf`。官网下载包 `https://create.gosim.org/survey26/platform/downloads/examples/python-pro.zip`，许可证同为 CC BY-NC 4.0。
+- 保留其科学密度、平滑必做价值、时间定价和局部指向搜索；扩展到公开网格及必做参数，增加单次决策收益缓存与请求曝光窗口校验，修复零科学价值密度桶异常。
+- 接入本项目真实反馈账本、失效回滚、原指向标定、原报告策略和相连的两阶段模型；不采用上游另外的标定器或模型架构。旧相位搜索只保留为非默认对照。
+- 详细成绩、实验拒绝记录、待完成的正式验证见根目录 HANDOFF_ZH.md。不宣称已超过官方 Pro 或第一名。

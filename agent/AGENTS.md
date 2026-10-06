@@ -28,6 +28,8 @@ agent_core/
   advice.py                connected notice parsing -> bounded nightly model plan
   scoring.py               factor/score estimates from PUBLIC scoring config only
   planner.py               decision logic: wait / observe / report / finish
+  pro_planner.py           active Pro-derived search: science density and time price
+  pro_skymath.py           attributed public geometry used by the Pro search
   llm_client.py            OpenAI-compatible chat client, defaults to Kimi Coding Plan
   clock.py                 CPU/wall budgets, measured night progress and search costs
   memory.py                optional, best-effort JSONL decision trace (off by default)
@@ -38,7 +40,12 @@ requirements.txt           none needed -- standard library only
 
 ## Changing the strategy
 
-Target ranking, fibre filling and exposure sizing live in `agent_core/planner.py`.
+The active target ranking, fibre filling and exposure sizing live in
+`agent_core/pro_planner.py`, connected through `Planner._pro_plan` in planner.py.
+The previous phase search remains in `_legacy_plan` for ablations; it is not the
+default runtime search. Public completion bounds and rollback remain in state.py;
+Pro estimates must never replace the actual feedback ledger. Read HANDOFF_ZH.md
+at the repository root before continuing optimization.
 The two connected calls (notice parsing + task planning) are issued by advice.py
 from the night-advice path in planner.py through agent_core/llm_client.py; the
 instrument-fault confirmation call is a third, rarer call from the same module. You

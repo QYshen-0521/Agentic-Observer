@@ -33,6 +33,7 @@ from .advice import make_night_plan
 from .calibration import PointingCalibration
 from .exposure import ExposureModel
 from .fields import phase_fields
+from .pro_planner import Planner as ProPlanner
 from .requests import RequestScheduler
 
 PLAN_FACTOR_SAFETY = 0.9
@@ -102,6 +103,8 @@ class Planner:
         self.scheduled_requests = True
         self._science_rate = 0.005
         self._advice_cache = OrderedDict()
+        self._pro = ProPlanner(self._core_public_input(state),log)
+        self._pro._offset_evidence = lambda hits: None
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -113,6 +116,9 @@ class Planner:
         now = parse_utc(payload["now_utc"])
         hours = (now - state.survey_start).total_seconds() / 3600.0
         self._hours = hours
+        self._pro.on_result(payload.get("last_result"),now,hours)
+        self._pro.on_messages(payload.get("new_messages") or [],payload.get("latest_bulletin"))
+        self._pro.on_requests(payload.get("active_requests") or [])
         self._decision_values = None
         self._decision_models = None
         self._model_wait_start = getattr(self.llm, 'wait_used', 0.0)
@@ -130,6 +136,7 @@ class Planner:
         if self.calibration.feedback(payload.get("last_result")):
             self.log(f"planner: calibrated pointing offset={self.calibration.offset}")
             state.misses = [0] * len(state.ids)
+            self._pro.vcache = None
             state.reset_stagnation()
             state.progress_epoch += 1
         # Consume the previous valid exposure before applying a later invalidation.
@@ -167,7 +174,8 @@ class Planner:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
 
-        self._prepare_requests(payload.get("active_requests") or [], now)
+        # The active search already ingested the public requests above. The
+        # legacy beam scheduler is retained for ablations, not run twice here.
         report = self._maybe_report(hours, payload)
         if report is not None:
             return report
@@ -296,9 +304,20 @@ class Planner:
             self.repairs += 1
             self.false_reports = 0
             self.state.forget_quality_history()
+            self._pro.forget_quality_history()
         else:
             self.false_reports += 1
         self.log(f"planner: report feedback repairs={self.repairs} false_since_repair={self.false_reports}")
+
+    @staticmethod
+    def _core_public_input(state):
+        scoring = state.scoring
+        data = dict(state.public_init)
+        data['site'] = dict(data['site'],latitude_deg=state.lat,longitude_deg=state.lon,minimum_altitude_deg=state.min_alt)
+        data['scoring'] = dict(data.get('scoring') or {},q0=scoring.q0,flux_zero_point=scoring.flux_zero_point,
+            exposure_zero_point_seconds=scoring.exposure_zero_point_seconds,airmass_exponent=scoring.airmass_exponent,
+            lunar_model=scoring.lunar_model,program={'bands':scoring.program_bands,'multipliers':scoring.program_multipliers,'mismatch_multiplier':scoring.mismatch_multiplier})
+        return data
 
     def _maybe_report(self, hours: float, payload: dict):
         state = self.state
@@ -472,7 +491,48 @@ class Planner:
         finally:
             self.clock.last_search_cost = time.process_time()-started
 
+    def _pro_plan(self, now, night_end, night_index, hours):
+        state,p = self.state,self._pro
+        p.factor = state.factor[:]
+        p.cur = [score/max(w,1e-9) for score,w in zip(state.best_score,state.weight)]
+        p.misses = state.misses[:]
+        if p.required_priority!=self.required_priority:
+            p.vdirty.update(i for i,required in enumerate(state.required) if required)
+        p.extra_avoid = set(state.extra_avoid)
+        p.duration_scale = state.duration_scale
+        p.required_priority = self.required_priority
+        p.fast_level = state.fast_level
+        p.force_program = state.force_program
+        action = p.plan(now,night_end,night_index,hours)
+        if action is None:
+            return None
+        desired = action['pointing']
+        alt,az = self.calibration.command(desired['alt_deg'],desired['az_deg'])
+        if not state.min_alt<=alt<=90:
+            p.pending = {}
+            return None
+        action['pointing'] = {'alt_deg':round(alt,4),'az_deg':round(az,4)%360}
+        predictions = {}
+        band_scale = p.calibrated_band_scale(hours)
+        for target_id,prediction in p.pending.items():
+            i = state.index_of[target_id]
+            factor = min(1.0,prediction['pred'])
+            band = p._band(prediction['model']*band_scale)
+            score = state.weight[i]*factor*state.scoring.program_multiplier(action['program'],band)
+            predictions[target_id] = PendingPrediction(prediction['model'],prediction['band_model'],prediction['alt'],prediction['az'],prediction['clean'],max(0,score-state.best_score[i]))
+        state.pending = predictions
+        state.pending_action_index = self._current_action_index
+        state.pending_program = action['program']
+        state.pending_duration = action['duration_seconds']
+        state.pending_night = night_index
+        rate = sum(pred.expected_gain for pred in predictions.values())/action['duration_seconds']
+        self._science_rate = .9*self._science_rate+.1*rate
+        return action
+
     def _plan(self, now, night_end, night_index: int, hours: float):
+        return self._pro_plan(now,night_end,night_index,hours)
+
+    def _legacy_plan(self, now, night_end, night_index: int, hours: float):
         state = self.state
         # Snapshot-local caches: feedback, model advice and request progress can
         # all change between calls. Never reuse these across decision requests.

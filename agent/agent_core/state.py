@@ -59,6 +59,7 @@ def _mod(a: float, n: float) -> float:
 
 class SurveyState:
     def __init__(self, init_payload: dict):
+        self.public_init = init_payload
         site = init_payload["site"]
         survey = init_payload["survey"]
         instrument = init_payload["instrument"]
