@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--trace', action='store_true')
     args = parser.parse_args()
     out = args.out.resolve()
+    if out.is_relative_to(args.agent_dir.resolve()):
+        raise SystemExit('The output directory must be outside the source agent directory.')
     snapshot = out/'agent-snapshot'
     if snapshot.exists():
         raise SystemExit('Use a new output directory; snapshots must stay immutable.')

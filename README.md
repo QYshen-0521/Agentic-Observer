@@ -63,6 +63,17 @@ python local_runner.py --card L1 --out strategy_review_output/iterations/L1-k3
 两种测试都沿用正式 agent 的超时、重试和模型调用上限，详细调用结果见输出目录的 `agent.log`。
 Windows 本地评分器没有平台的容器 CPU 计量，模型等待可能计入预算；本地分数用于策略对照，正式成绩以平台为准。
 
+可复现四卡对照会先复制不含私有配置的不可变源码快照，输出目录必须是新的目录：
+
+```powershell
+python tools/benchmark_strategy.py --out strategy_review_output/iterations/rules --trace
+python tools/benchmark_strategy.py --out strategy_review_output/iterations/model --cards L1 --with-model --env-file agent/.env --trace
+```
+
+`--disable integration`、`--disable stagnation`、`--disable requests`、`--disable pacing`
+可在实验快照中单独关闭相应模块做消融，不修改正式源码。`--trace` 使用现有
+`AGENT_TRACE_PATH` 记录搜索成本、预算、档位、预测科学增量与真实增量，默认关闭。
+
 `agent/agent_core/` 提供天球几何、光纤分配、曝光搜索、实际反馈账本、状态回滚、
 CPU/实际时间预算和统一动作校验。实现以 GOSIM 官网当前 Python 示例为基础；来源与
 团队改动记录见 [agent/UPSTREAM.md](agent/UPSTREAM.md)。完整接口说明保存在 `agent/docs/`。

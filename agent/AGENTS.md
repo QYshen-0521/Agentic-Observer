@@ -22,10 +22,13 @@ agent_core/
   state.py                 SurveyState: catalogue + everything tracked across decisions
   geometry.py              public sky maths (sidereal time, alt/az, fibre grid)
   calibration.py           fixed pointing offset inferred from public hit feedback
+  exposure.py              snapshot-local public-slot midpoint integration
+  requests.py              bounded future-window request beam search
+  advice.py                connected notice parsing -> bounded nightly model plan
   scoring.py               factor/score estimates from PUBLIC scoring config only
   planner.py               decision logic: wait / observe / report / finish
   llm_client.py            OpenAI-compatible chat client, defaults to Kimi Coding Plan
-  clock.py                 fair-clock budget: pace on remaining_real_cpu_seconds + process CPU time
+  clock.py                 CPU/wall budgets, measured night progress and search costs
   memory.py                optional, best-effort JSONL decision trace (off by default)
   validation.py            protocol-legal action checking + a deterministic fallback
 ../observer.project.json   sole platform manifest (runs agent/agent.py from the repo root)
